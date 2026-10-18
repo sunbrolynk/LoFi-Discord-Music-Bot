@@ -1,0 +1,17 @@
+services:
+  lofi-music-bot:
+    image: ghcr.io/sunbrolynk/lofi-discord-music-bot:latest
+    container_name: lofi-discord-music-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://streams.ilovemusic.de/iloveradio17.mp3}
+      - DATABASE_PATH=/app/data/lofi_bot.db
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - lofi_bot_data:/app/data
+
+volumes:
+  lofi_bot_data:
