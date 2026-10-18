@@ -68,7 +68,9 @@ class LoFiBot(commands.Bot):
             client_id=config.spotify_client_id,
             client_secret=config.spotify_client_secret,
         )
-        self.audio = AudioManager(bot=self, db=self.db)
+        self.audio = AudioManager(
+            bot=self, db=self.db, backup_streams=config.backup_fallback_stream_urls
+        )
         self._sessions_restored = False
 
     async def setup_hook(self) -> None:

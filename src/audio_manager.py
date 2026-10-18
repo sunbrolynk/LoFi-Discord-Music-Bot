@@ -11,14 +11,15 @@ import secrets
 import sys
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import aiohttp
 import discord
 import yt_dlp
 
+from src.config import DEFAULT_BACKUP_STREAM_URLS
 from src.database import DatabaseManager, GuildSettings, PlaylistTrack, TrackMetadata
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,10 @@ VOICE_CONNECT_TIMEOUT_SECONDS = 30.0
 IDLE_RECOVERY_SECONDS = 90.0
 UNHEALTHY_IDLE_SECONDS = 600.0
 
-# Direct 24/7 Icecast LoFi stream used if a scraped web track ever fails
-DIRECT_ICECAST_LOFI_URL = "https://stream.laut.fm/lofi"
+SEARCH_CANDIDATES = 5
+FAILED_MEDIA_TTL_SECONDS = 6 * 3600.0
+DEAD_STREAM_TTL_SECONDS = 1800.0
+STREAM_CHECK_TIMEOUT_SECONDS = 10.0
 
 YTDL_OPTIONS: Any = {
     "format": "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio/best",
@@ -47,7 +50,7 @@ YTDL_OPTIONS: Any = {
 }
 
 AUDIO_FILE_RE = re.compile(
-    r"[\"'\`]([^\"'\`\s<>]+?\.(?:mp3|ogg|m4a)(?:\?[^\"'\`\s<>]*)?)[\"'\`]",
+    r"[\"'\`]([^\"'\`<>\n]+?\.(?:mp3|ogg|m4a)(?:\?[^\"'\`\s<>]*)?)[\"'\`]",
     re.IGNORECASE,
 )
 SCRIPT_SRC_RE = re.compile(
@@ -84,7 +87,7 @@ def extract_audio_urls_from_text(text: str, base_url: str) -> list[str]:
     """Extract and normalize direct audio file URLs (.mp3/.ogg/.m4a) from HTML or JS."""
     found: list[str] = []
     for match in AUDIO_FILE_RE.findall(text):
-        full_url = urljoin(base_url, match)
+        full_url = urljoin(base_url, quote(match, safe=":/?=&%#"))
         if full_url.startswith(("http://", "https://")) and full_url not in found:
             found.append(full_url)
     return found
@@ -117,38 +120,62 @@ def compute_next_index(
     return None
 
 
-def _extract_stream_url_sync(search_query: str) -> str:
-    """Extract a direct progressive HTTP audio stream URL via SoundCloud or YouTube."""
-    if search_query.startswith(("http://", "https://")):
-        candidates = [search_query]
-    else:
-        # Try SoundCloud first (no datacenter IP blocks or 403s), then YouTube
-        candidates = [f"scsearch1:{search_query}", f"ytsearch1:{search_query}"]
+class NoStreamFound(RuntimeError):
+    """No search result could be streamed; `failed` lists the result pages that errored."""
 
-    last_err: Exception | None = None
+    def __init__(self, message: str, failed: list[str]) -> None:
+        super().__init__(message)
+        self.failed = failed
+
+
+def _stream_url_from_page(ydl: yt_dlp.YoutubeDL, page: str) -> str:
+    info = ydl.extract_info(page, download=False) or {}
+    entries = info.get("entries")
+    if isinstance(entries, list) and entries:
+        info = entries[0]
+    stream_url = info.get("url") if isinstance(info, dict) else None
+    if not stream_url:
+        raise ValueError("no stream URL in the extracted media")
+    return str(stream_url)
+
+
+def _extract_stream_url_sync(query: str, skip: frozenset[str]) -> tuple[str, list[str]]:
+    """Return a stream URL plus result pages that failed, trying SoundCloud then YouTube."""
+    failed: list[str] = []
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-        for candidate in candidates:
-            try:
-                info = ydl.extract_info(candidate, download=False)
-                if not info:
-                    continue
-                entries = info.get("entries")
-                target = entries[0] if isinstance(entries, list) and len(entries) > 0 else info
-                if not isinstance(target, dict):
-                    continue
-                stream_url = target.get("url")
-                if stream_url:
-                    logger.info(
-                        "Resolved audio stream via '%s': %s",
-                        candidate,
-                        target.get("title", search_query),
-                    )
-                    return str(stream_url)
-            except Exception as exc:
-                last_err = exc
-                logger.warning("Candidate '%s' failed: %s", candidate, exc)
+        if query.startswith(("http://", "https://")):
+            return _stream_url_from_page(ydl, query), failed
 
-    raise RuntimeError(f"No playable stream found for '{search_query}': {last_err}")
+        with yt_dlp.YoutubeDL({**YTDL_OPTIONS, "extract_flat": "in_playlist"}) as finder:
+            for prefix, source in (("scsearch", "SoundCloud"), ("ytsearch", "YouTube")):
+                try:
+                    found = finder.extract_info(
+                        f"{prefix}{SEARCH_CANDIDATES}:{query}", download=False
+                    )
+                except Exception as exc:
+                    logger.warning("%s search failed for '%s': %s", source, query, exc)
+                    continue
+                entries = [e for e in (found or {}).get("entries") or [] if isinstance(e, dict)]
+                pages = [str(e["url"]) for e in entries if e.get("url")]
+                if not pages:
+                    logger.warning("%s search found nothing for '%s'.", source, query)
+                    continue
+                for page in pages:
+                    if page in skip or page in failed:
+                        continue
+                    try:
+                        stream_url = _stream_url_from_page(ydl, page)
+                    except Exception as exc:
+                        failed.append(page)
+                        logger.warning(
+                            "Skipping %s result %s for '%s': %s", source, page, query, exc
+                        )
+                        continue
+                    logger.info("Resolved '%s' via %s: %s", query, source, page)
+                    return stream_url, failed
+                logger.warning("No playable %s result for '%s'.", source, query)
+
+    raise NoStreamFound(f"No playable stream found for '{query}'", failed)
 
 
 ActiveTrack = PlaylistTrack | TrackMetadata
@@ -158,9 +185,19 @@ EndHandler = Callable[[Exception | None], Awaitable[None]]
 class AudioManager:
     """Coordinates voice connections, playlist playback, and fallback streams per guild."""
 
-    def __init__(self, bot: discord.Client, db: DatabaseManager) -> None:
+    def __init__(
+        self,
+        bot: discord.Client,
+        db: DatabaseManager,
+        backup_streams: Sequence[str] = DEFAULT_BACKUP_STREAM_URLS,
+    ) -> None:
         self.bot = bot
         self.db = db
+        self.backup_streams = list(backup_streams)
+        self._dead_streams: dict[str, float] = {}
+        self._failed_media: dict[str, float] = {}
+        self._notice_problems: set[int] = set()
+        self._fallback_playing: dict[int, str] = {}
         self._active_tracks: dict[int, ActiveTrack | None] = {}
         self._locks: dict[int, asyncio.Lock] = {}
         self._lofi_radio_cache: list[str] = []
@@ -211,13 +248,32 @@ class AudioManager:
         if not settings.control_channel_id:
             return
         channel = guild.get_channel(settings.control_channel_id)
-        if isinstance(channel, discord.TextChannel):
-            embed_color = color if color is not None else discord.Color.purple()
-            embed = discord.Embed(title=title, description=description, color=embed_color)
-            try:
-                await channel.send(embed=embed)
-            except discord.DiscordException as exc:
-                logger.warning("Failed to send mod channel notice in %s: %s", guild.id, exc)
+        if not isinstance(channel, discord.TextChannel):
+            self._log_notice_problem(guild, f"channel {settings.control_channel_id}")
+            return
+        embed_color = color if color is not None else discord.Color.purple()
+        embed = discord.Embed(title=title, description=description, color=embed_color)
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            self._log_notice_problem(guild, f"#{channel.name} ({channel.id})")
+        except discord.DiscordException as exc:
+            logger.warning("Failed to send mod channel notice in %s: %s", guild.id, exc)
+        else:
+            self._notice_problems.discard(guild.id)
+
+    def _log_notice_problem(self, guild: discord.Guild, channel_label: str) -> None:
+        """Log one actionable line per guild until notices work again."""
+        if guild.id in self._notice_problems:
+            return
+        self._notice_problems.add(guild.id)
+        logger.warning(
+            "Can't post notices to mod channel %s in server '%s' (%s): give the bot "
+            "View Channel, Send Messages and Embed Links there. Notices are skipped until then.",
+            channel_label,
+            guild.name,
+            guild.id,
+        )
 
     @staticmethod
     def _voice_connected(guild: discord.Guild) -> bool:
@@ -263,12 +319,26 @@ class AudioManager:
     async def _resolve_fallback_stream_url(
         self,
         fallback_url: str,
-        force_direct_icecast: bool = False,
+        use_backup: bool = False,
     ) -> str:
-        """Resolve a playable stream URL from lofi.radio or a direct stream URL."""
-        if force_direct_icecast:
-            return DIRECT_ICECAST_LOFI_URL
+        """Return a reachable fallback stream: the server's own source, then the backups."""
+        if not use_backup:
+            for _ in range(3):
+                candidate = await self._primary_fallback_url(fallback_url)
+                if candidate is None:
+                    break
+                if await self._stream_reachable(candidate):
+                    return candidate
+        now = time.monotonic()
+        alive = [u for u in self.backup_streams if self._dead_streams.get(u, 0.0) <= now]
+        # Every backup is marked down: check them all again rather than go silent
+        for url in alive or self.backup_streams:
+            if await self._stream_reachable(url, recheck=not alive):
+                return url
+        raise RuntimeError("No fallback stream is reachable; every station failed its check.")
 
+    async def _primary_fallback_url(self, fallback_url: str) -> str | None:
+        """Turn a server's fallback setting into a stream URL, or None if it can't."""
         cleaned = fallback_url.strip()
         if not cleaned.startswith(("http://", "https://")):
             cleaned = f"https://{cleaned}"
@@ -277,54 +347,94 @@ class AudioManager:
             return cleaned
 
         if "lofi.radio" in cleaned.lower():
-            if self._lofi_radio_cache:
-                return self._lofi_radio_cache[secrets.randbelow(len(self._lofi_radio_cache))]
-
-            discovered: list[str] = []
-            timeout = aiohttp.ClientTimeout(total=10)
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(cleaned) as resp:
-                        if resp.status == 200:
-                            html = await resp.text()
-                            discovered.extend(extract_audio_urls_from_text(html, cleaned))
-                            script_urls = [urljoin(cleaned, s) for s in SCRIPT_SRC_RE.findall(html)]
-                            for script_url in script_urls[:5]:
-                                async with session.get(script_url) as s_resp:
-                                    if s_resp.status == 200:
-                                        js_text = await s_resp.text()
-                                        for u in extract_audio_urls_from_text(js_text, cleaned):
-                                            if u not in discovered:
-                                                discovered.append(u)
-            except Exception as exc:
-                logger.warning("Could not scrape lofi.radio directly: %s", exc)
-
-            if discovered:
-                self._lofi_radio_cache = discovered
-                return discovered[secrets.randbelow(len(discovered))]
-
-            # Resolve Purrple Cat (lofi.radio's artist catalog) via SoundCloud/yt-dlp
+            if not self._lofi_radio_cache:
+                self._lofi_radio_cache = await self._scrape_lofi_radio(cleaned)
+            now = time.monotonic()
+            live = [u for u in self._lofi_radio_cache if self._dead_streams.get(u, 0.0) <= now]
+            if live:
+                return live[secrets.randbelow(len(live))]
             query = LOFI_RADIO_QUERIES[secrets.randbelow(len(LOFI_RADIO_QUERIES))]
             try:
                 return await self._extract_stream_url(query)
             except Exception as exc:
-                logger.warning("Purrple Cat lookup failed (%s); using direct Icecast stream.", exc)
-                return DIRECT_ICECAST_LOFI_URL
+                logger.warning("Purrple Cat lookup failed (%s); using a backup stream.", exc)
+                return None
 
         try:
             return await self._extract_stream_url(cleaned)
         except Exception as exc:
-            logger.warning(
-                "Fallback URL %s failed (%s); using direct Icecast stream.", cleaned, exc
-            )
-            return DIRECT_ICECAST_LOFI_URL
+            logger.warning("Fallback URL %s failed (%s); using a backup stream.", cleaned, exc)
+            return None
 
     @staticmethod
-    async def _extract_stream_url(query: str) -> str:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_extract_stream_url_sync, query),
-            timeout=RESOLVE_TIMEOUT_SECONDS,
+    async def _scrape_lofi_radio(page_url: str) -> list[str]:
+        """Collect lofi.radio's song files, which it serves from its songs/ folder."""
+        discovered: list[str] = []
+        songs_base = urljoin(page_url.rstrip("/") + "/", "songs/")
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(page_url) as resp:
+                    if resp.status != 200:
+                        logger.warning("lofi.radio returned HTTP %s.", resp.status)
+                        return discovered
+                    html = await resp.text()
+                discovered.extend(extract_audio_urls_from_text(html, songs_base))
+                script_urls = [urljoin(page_url, s) for s in SCRIPT_SRC_RE.findall(html)]
+                for script_url in script_urls[:5]:
+                    async with session.get(script_url) as s_resp:
+                        if s_resp.status == 200:
+                            js_text = await s_resp.text()
+                            for u in extract_audio_urls_from_text(js_text, songs_base):
+                                if u not in discovered:
+                                    discovered.append(u)
+        except Exception as exc:
+            logger.warning("Could not scrape lofi.radio: %s", exc)
+        return discovered
+
+    async def _stream_reachable(self, url: str, recheck: bool = False) -> bool:
+        """Probe a stream URL, remembering a dead one for a while so it isn't hit every time."""
+        now = time.monotonic()
+        if not recheck and self._dead_streams.get(url, 0.0) > now:
+            return False
+        timeout = aiohttp.ClientTimeout(total=STREAM_CHECK_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={"Range": "bytes=0-0"}) as resp:
+                    status = resp.status
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            reason = str(exc) or type(exc).__name__
+        else:
+            if status < 400:
+                self._dead_streams.pop(url, None)
+                return True
+            reason = f"HTTP {status}"
+        self.mark_stream_dead(url, reason)
+        return False
+
+    def mark_stream_dead(self, url: str, reason: str) -> None:
+        """Skip a fallback stream for DEAD_STREAM_TTL_SECONDS."""
+        self._dead_streams[url] = time.monotonic() + DEAD_STREAM_TTL_SECONDS
+        logger.warning(
+            "Fallback stream %s is down (%s); skipping it for %d min.",
+            url,
+            reason,
+            DEAD_STREAM_TTL_SECONDS // 60,
         )
+
+    async def _extract_stream_url(self, query: str) -> str:
+        now = time.monotonic()
+        self._failed_media = {k: v for k, v in self._failed_media.items() if v > now}
+        try:
+            stream_url, failed = await asyncio.wait_for(
+                asyncio.to_thread(_extract_stream_url_sync, query, frozenset(self._failed_media)),
+                timeout=RESOLVE_TIMEOUT_SECONDS,
+            )
+        except NoStreamFound as exc:
+            self._failed_media.update(dict.fromkeys(exc.failed, now + FAILED_MEDIA_TTL_SECONDS))
+            raise
+        self._failed_media.update(dict.fromkeys(failed, now + FAILED_MEDIA_TTL_SECONDS))
+        return stream_url
 
     async def _resolve_with_retries(
         self,
@@ -508,18 +618,18 @@ class AudioManager:
         guild: discord.Guild,
         reason: str = "Manual fallback activated",
         announce: bool = True,
-        force_direct_icecast: bool = False,
+        use_backup: bool = False,
     ) -> None:
         """Switch a server immediately to its 24/7 fallback lofi radio stream."""
         with self._starting(guild.id):
-            await self._start_fallback(guild, reason, announce, force_direct_icecast)
+            await self._start_fallback(guild, reason, announce, use_backup)
 
     async def _start_fallback(
         self,
         guild: discord.Guild,
         reason: str,
         announce: bool,
-        force_direct_icecast: bool,
+        use_backup: bool,
     ) -> None:
         await self._set_wanted(guild.id, True)
         settings = await self.db.set_fallback_state(
@@ -529,7 +639,7 @@ class AudioManager:
         )
         stream_url = await self._resolve_fallback_stream_url(
             settings.fallback_url,
-            force_direct_icecast=force_direct_icecast,
+            use_backup=use_backup,
         )
         logger.info("Starting fallback stream in guild %s: %s", guild.id, stream_url)
 
@@ -538,6 +648,7 @@ class AudioManager:
                 return
             self._active_tracks[guild.id] = None
             self._fallback_started_at[guild.id] = time.monotonic()
+            self._fallback_playing[guild.id] = stream_url
             await self._play_stream(
                 guild,
                 stream_url,
@@ -561,7 +672,7 @@ class AudioManager:
         guild: discord.Guild,
         error: Exception | None = None,
     ) -> None:
-        """Queue the next fallback track or switch to direct Icecast if the stream died early."""
+        """Queue the next fallback track, or a backup station if the stream died early."""
         generation = self._generation.get(guild.id)
         settings = await self.db.get_guild_settings(guild.id)
         if not settings.on_fallback or guild.id not in self._wanted:
@@ -571,9 +682,12 @@ class AudioManager:
             return
 
         elapsed = time.monotonic() - self._fallback_started_at.get(guild.id, 0.0)
-        # A stream that dies within seconds is broken; back off and use the direct Icecast stream
-        use_direct = error is not None or elapsed < 5.0
-        if use_direct:
+        # A stream that dies within seconds is broken; mark it, back off, and use a backup
+        use_backup = error is not None or elapsed < 5.0
+        if use_backup:
+            dead_url = self._fallback_playing.get(guild.id)
+            if dead_url:
+                self.mark_stream_dead(dead_url, f"stopped after {elapsed:.0f}s: {error}")
             self._lofi_radio_cache.clear()
             failures = self._fallback_failures.get(guild.id, 0)
             self._fallback_failures[guild.id] = failures + 1
@@ -587,7 +701,7 @@ class AudioManager:
             guild,
             reason=settings.fallback_reason or "24/7 Fallback Radio",
             announce=False,
-            force_direct_icecast=use_direct,
+            use_backup=use_backup,
         )
 
     async def _play_track(

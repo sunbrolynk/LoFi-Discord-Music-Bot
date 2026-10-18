@@ -71,6 +71,7 @@ class FakeVoiceChannel(discord.VoiceChannel):
 class FakeGuild:
     def __init__(self) -> None:
         self.id = GUILD_ID
+        self.name = "Test Server"
         self.voice_client: FakeVoiceClient | None = None
         self.channel = FakeVoiceChannel(self)
 
@@ -124,7 +125,11 @@ async def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     async def fake_resolve(query: str) -> str:
         return f"https://cdn.example/{query.split(' - ')[-1].replace(' ', '_')}"
 
+    async def reachable(url: str, recheck: bool = False) -> bool:
+        return True
+
     monkeypatch.setattr(manager, "_extract_stream_url", fake_resolve)
+    monkeypatch.setattr(manager, "_stream_reachable", reachable)
     yield manager, guild, db
     for task in [*manager._background, *manager._recovery_tasks.values()]:
         task.cancel()
@@ -209,6 +214,7 @@ async def test_restore_sessions_resumes_after_restart(setup: Any, tmp_path: Path
     restarted_guild = FakeGuild()
     restarted = AudioManager(bot=FakeBot(restarted_guild), db=db)  # type: ignore[arg-type]
     restarted._extract_stream_url = manager._extract_stream_url  # type: ignore[method-assign]
+    restarted._stream_reachable = manager._stream_reachable  # type: ignore[method-assign]
     await restarted.restore_sessions()
     await settle()
     assert restarted_guild.voice_client is not None
