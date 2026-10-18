@@ -120,14 +120,6 @@ def compute_next_index(
     return None
 
 
-class NoStreamFound(RuntimeError):
-    """No search result could be streamed; `failed` lists the result pages that errored."""
-
-    def __init__(self, message: str, failed: list[str]) -> None:
-        super().__init__(message)
-        self.failed = failed
-
-
 def _stream_url_from_page(ydl: yt_dlp.YoutubeDL, page: str) -> str:
     info = ydl.extract_info(page, download=False) or {}
     entries = info.get("entries")
@@ -139,12 +131,16 @@ def _stream_url_from_page(ydl: yt_dlp.YoutubeDL, page: str) -> str:
     return str(stream_url)
 
 
-def _extract_stream_url_sync(query: str, skip: frozenset[str]) -> tuple[str, list[str]]:
-    """Return a stream URL plus result pages that failed, trying SoundCloud then YouTube."""
-    failed: list[str] = []
+def _extract_stream_url_sync(
+    query: str,
+    skip: frozenset[str],
+    on_failed: Callable[[str], None],
+) -> str:
+    """Return a stream URL, trying SoundCloud then YouTube results; report each failed page."""
+    failed: set[str] = set()
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
         if query.startswith(("http://", "https://")):
-            return _stream_url_from_page(ydl, query), failed
+            return _stream_url_from_page(ydl, query)
 
         with yt_dlp.YoutubeDL({**YTDL_OPTIONS, "extract_flat": "in_playlist"}) as finder:
             for prefix, source in (("scsearch", "SoundCloud"), ("ytsearch", "YouTube")):
@@ -166,16 +162,17 @@ def _extract_stream_url_sync(query: str, skip: frozenset[str]) -> tuple[str, lis
                     try:
                         stream_url = _stream_url_from_page(ydl, page)
                     except Exception as exc:
-                        failed.append(page)
+                        failed.add(page)
+                        on_failed(page)
                         logger.warning(
                             "Skipping %s result %s for '%s': %s", source, page, query, exc
                         )
                         continue
                     logger.info("Resolved '%s' via %s: %s", query, source, page)
-                    return stream_url, failed
+                    return stream_url
                 logger.warning("No playable %s result for '%s'.", source, query)
 
-    raise NoStreamFound(f"No playable stream found for '{query}'", failed)
+    raise RuntimeError(f"No playable stream found for '{query}'")
 
 
 ActiveTrack = PlaylistTrack | TrackMetadata
@@ -250,6 +247,10 @@ class AudioManager:
         channel = guild.get_channel(settings.control_channel_id)
         if not isinstance(channel, discord.TextChannel):
             self._log_notice_problem(guild, f"channel {settings.control_channel_id}")
+            return
+        perms = channel.permissions_for(guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            self._log_notice_problem(guild, f"#{channel.name} ({channel.id})")
             return
         embed_color = color if color is not None else discord.Color.purple()
         embed = discord.Embed(title=title, description=description, color=embed_color)
@@ -331,9 +332,12 @@ class AudioManager:
                     return candidate
         now = time.monotonic()
         alive = [u for u in self.backup_streams if self._dead_streams.get(u, 0.0) <= now]
-        # Every backup is marked down: check them all again rather than go silent
-        for url in alive or self.backup_streams:
-            if await self._stream_reachable(url, recheck=not alive):
+        for url in alive:
+            if await self._stream_reachable(url):
+                return url
+        # Nothing passed: recheck the ones skipped for an earlier failure rather than go silent
+        for url in self.backup_streams:
+            if url not in alive and await self._stream_reachable(url, recheck=True):
                 return url
         raise RuntimeError("No fallback stream is reachable; every station failed its check.")
 
@@ -425,16 +429,18 @@ class AudioManager:
     async def _extract_stream_url(self, query: str) -> str:
         now = time.monotonic()
         self._failed_media = {k: v for k, v in self._failed_media.items() if v > now}
-        try:
-            stream_url, failed = await asyncio.wait_for(
-                asyncio.to_thread(_extract_stream_url_sync, query, frozenset(self._failed_media)),
-                timeout=RESOLVE_TIMEOUT_SECONDS,
-            )
-        except NoStreamFound as exc:
-            self._failed_media.update(dict.fromkeys(exc.failed, now + FAILED_MEDIA_TTL_SECONDS))
-            raise
-        self._failed_media.update(dict.fromkeys(failed, now + FAILED_MEDIA_TTL_SECONDS))
-        return stream_url
+        until = now + FAILED_MEDIA_TTL_SECONDS
+
+        # Called from the worker thread as each page fails, so a timeout keeps what it learned
+        def remember(page: str) -> None:
+            self._failed_media[page] = until
+
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _extract_stream_url_sync, query, frozenset(self._failed_media), remember
+            ),
+            timeout=RESOLVE_TIMEOUT_SECONDS,
+        )
 
     async def _resolve_with_retries(
         self,
@@ -675,6 +681,8 @@ class AudioManager:
         """Queue the next fallback track, or a backup station if the stream died early."""
         generation = self._generation.get(guild.id)
         settings = await self.db.get_guild_settings(guild.id)
+        if self._generation.get(guild.id) != generation:
+            return
         if not settings.on_fallback or guild.id not in self._wanted:
             return
         if not self._voice_connected(guild):

@@ -341,3 +341,18 @@ async def test_recovery_waits_out_an_in_flight_lookup(setup: Any, monkeypatch: A
     await settle()
     assert lookups == ["Cat - Song A"]
     assert guild.voice_client.plays == ["https://cdn.example/Song_A"]
+
+
+async def test_stale_fallback_callback_leaves_the_new_station_alone(setup: Any) -> None:
+    manager, guild, db = setup
+    await manager.start_fallback(guild, announce=False)
+    real_settings = db.get_guild_settings
+
+    async def replaced_meanwhile(guild_id: int) -> Any:
+        manager._generation[guild_id] += 1
+        manager._fallback_playing[guild_id] = "https://radio.example/new.mp3"
+        return await real_settings(guild_id)
+
+    db.get_guild_settings = replaced_meanwhile
+    await manager._handle_fallback_track_finished(guild, error=RuntimeError("old stream"))
+    assert manager._dead_streams == {}
