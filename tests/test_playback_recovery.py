@@ -272,3 +272,43 @@ async def test_search_plays_immediately_when_idle(setup: Any) -> None:
     manager, guild, _ = setup
     assert await manager.enqueue(guild, TrackMetadata("", "Now Song", "Dog")) == 0
     assert guild.voice_client.plays == ["https://cdn.example/Now_Song"]
+
+
+async def test_backoff_delay_caps_huge_attempts() -> None:
+    assert backoff_delay(5000) == 300.0
+
+
+async def test_idle_search_resumes_saved_cursor_without_skipping(setup: Any) -> None:
+    manager, guild, _ = setup
+    await manager.enqueue(guild, TrackMetadata("", "Now Song", "Dog"))
+    guild.voice_client.finish()
+    await settle()
+    assert guild.voice_client.plays[-1] == "https://cdn.example/Song_A"
+
+
+async def test_unplayable_queued_song_moves_on(setup: Any, monkeypatch: Any) -> None:
+    manager, guild, db = setup
+    await db.update_fallback_config(GUILD_ID, triggers="manual_only")
+    resolve = manager._extract_stream_url
+
+    async def picky(query: str) -> str:
+        if "Broken" in query:
+            raise RuntimeError("HTTP Error 404")
+        return str(await resolve(query))
+
+    monkeypatch.setattr(manager, "_extract_stream_url", picky)
+    monkeypatch.setattr(manager, "notify_control_channel", lambda *a, **k: asyncio.sleep(0))
+    await manager.play_playlist_index(guild, index=0)
+    await manager.enqueue(guild, TrackMetadata("", "Broken Song", "Dog"))
+    await manager.enqueue(guild, TrackMetadata("", "Good Song", "Dog"))
+    guild.voice_client.finish()
+    await settle()
+    assert guild.voice_client.plays[-1] == "https://cdn.example/Good_Song"
+
+
+async def test_recovery_leaves_already_recovered_playback_alone(setup: Any) -> None:
+    manager, guild, _ = setup
+    await manager.play_playlist_index(guild, index=0)
+    manager.schedule_recovery(guild, "test")
+    await settle()
+    assert guild.voice_client.plays == ["https://cdn.example/Song_A"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import secrets
@@ -75,7 +76,7 @@ def should_fallback_on_error(triggers: str) -> bool:
 
 def backoff_delay(attempt: int, base: float = 5.0, cap: float = 300.0) -> float:
     """Return an exponential backoff delay in seconds for a zero-based attempt number."""
-    return min(cap, base * 2.0 ** max(0, attempt))
+    return min(cap, base * 2.0 ** min(max(0, attempt), 32))
 
 
 def extract_audio_urls_from_text(text: str, base_url: str) -> list[str]:
@@ -167,6 +168,7 @@ class AudioManager:
         # Bumped on every new source so the stopped source's after-callback is ignored
         self._generation: dict[int, int] = {}
         self._queues: dict[int, deque[TrackMetadata]] = {}
+        self._queue_interrupted: dict[int, bool] = {}
         self._wanted: set[int] = set()
         self._idle_since: dict[int, float] = {}
         self._recovery_attempts: dict[int, int] = {}
@@ -210,6 +212,15 @@ class AudioManager:
     def _voice_connected(guild: discord.Guild) -> bool:
         voice_client = guild.voice_client
         return isinstance(voice_client, discord.VoiceClient) and voice_client.is_connected()
+
+    @staticmethod
+    def _voice_busy(guild: discord.Guild) -> bool:
+        voice_client = guild.voice_client
+        return (
+            isinstance(voice_client, discord.VoiceClient)
+            and voice_client.is_connected()
+            and (voice_client.is_playing() or voice_client.is_paused())
+        )
 
     async def ensure_voice_client(self, guild: discord.Guild) -> discord.VoiceClient:
         """Connect to or move to the server's configured voice channel."""
@@ -412,7 +423,7 @@ class AudioManager:
                     reason,
                 )
                 await asyncio.sleep(delay)
-                if guild_id not in self._wanted:
+                if guild_id not in self._wanted or self._voice_busy(guild):
                     return
                 try:
                     await self.resume_from_state(guild)
@@ -466,12 +477,7 @@ class AudioManager:
             guild = self.bot.get_guild(guild_id)
             if guild is None:
                 continue
-            voice_client = guild.voice_client
-            if (
-                isinstance(voice_client, discord.VoiceClient)
-                and voice_client.is_connected()
-                and (voice_client.is_playing() or voice_client.is_paused())
-            ):
+            if self._voice_busy(guild):
                 self._idle_since.pop(guild_id, None)
                 self._recovery_attempts.pop(guild_id, None)
                 continue
@@ -565,8 +571,8 @@ class AudioManager:
         track: ActiveTrack,
         settings: GuildSettings,
         on_end: EndHandler,
-    ) -> None:
-        """Resolve and play one track, falling back to radio if it cannot be streamed."""
+    ) -> bool:
+        """Resolve and play one track, or fall back to radio; return whether audio started."""
         try:
             stream_url = await self._resolve_with_retries(track)
         except Exception as exc:
@@ -576,7 +582,7 @@ class AudioManager:
                     guild,
                     reason=f"Failed to stream '{track.title}' by {track.artist}.",
                 )
-                return
+                return True
             await self.notify_control_channel(
                 guild,
                 title="⚠️ Track Stream Error",
@@ -586,15 +592,16 @@ class AudioManager:
                 ),
                 color=discord.Color.red(),
             )
-            return
+            return False
 
         async with self._get_lock(guild.id):
             if guild.id not in self._wanted:
-                return
+                return False
             await self.db.set_fallback_state(guild.id, on_fallback=False, reason="")
             self._active_tracks[guild.id] = track
             await self._play_stream(guild, stream_url, settings.volume, on_end)
         logger.info("Now playing '%s - %s' in guild %s.", track.artist, track.title, guild.id)
+        return True
 
     async def play_playlist_index(
         self,
@@ -632,28 +639,38 @@ class AudioManager:
         )
 
     async def _play_next_queued(self, guild: discord.Guild) -> bool:
-        """Play the next searched track if one is waiting; return whether one was started."""
+        """Play the next playable searched track; return whether audio started."""
         queue = self._queues.get(guild.id)
-        if not queue:
-            return False
-        track = queue.popleft()
-        await self._set_wanted(guild.id, True)
-        settings = await self.db.get_guild_settings(guild.id)
-        await self._play_track(
-            guild,
-            track,
-            settings,
-            lambda error: self._handle_track_finished(guild, settings.current_index, error),
-        )
-        return True
+        previous = self._active_tracks.get(guild.id)
+        if isinstance(previous, PlaylistTrack):
+            self._queue_interrupted[guild.id] = True
+        elif previous is None:
+            self._queue_interrupted[guild.id] = False
+        while queue:
+            track = queue.popleft()
+            await self._set_wanted(guild.id, True)
+            settings = await self.db.get_guild_settings(guild.id)
+            # Advance past the cursor only if the queue cut in after a playlist track
+            finished: int | None = (
+                settings.current_index if self._queue_interrupted.get(guild.id) else None
+            )
+            started = await self._play_track(
+                guild,
+                track,
+                settings,
+                functools.partial(self._handle_track_finished, guild, finished),
+            )
+            if started:
+                return True
+        return False
 
     async def _handle_track_finished(
         self,
         guild: discord.Guild,
-        finished_index: int,
+        finished_index: int | None,
         error: Exception | None,
     ) -> None:
-        """Advance to the next track or trigger fallback when a track finishes."""
+        """Advance to the next track, or resume the saved cursor if `finished_index` is None."""
         settings = await self.db.get_guild_settings(guild.id)
         if settings.on_fallback or guild.id not in self._wanted:
             return
@@ -670,6 +687,10 @@ class AudioManager:
             return
 
         if await self._play_next_queued(guild):
+            return
+
+        if finished_index is None:
+            await self.play_playlist_index(guild)
             return
 
         playlist = await self.db.get_playlist(guild.id)
@@ -702,13 +723,7 @@ class AudioManager:
         """Queue a searched track; play it now if the playlist isn't playing. Returns its slot."""
         self._queues.setdefault(guild.id, deque()).append(track)
         settings = await self.db.get_guild_settings(guild.id)
-        voice_client = guild.voice_client
-        busy = (
-            isinstance(voice_client, discord.VoiceClient)
-            and voice_client.is_connected()
-            and (voice_client.is_playing() or voice_client.is_paused())
-        )
-        if busy and not settings.on_fallback:
+        if self._voice_busy(guild) and not settings.on_fallback:
             return self.queue_length(guild.id)
         await self._play_next_queued(guild)
         return 0
