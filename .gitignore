@@ -1,0 +1,31 @@
+# Secrets & Environment Variables
+.env
+.env.*
+!.env.example
+
+# Python & Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Local SQLite Databases (keep folder via .gitkeep)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Tooling & Test Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / Editor Files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,28 @@
+[project]
+name = "lofi-discord-music-bot"
+version = "1.0.0"
+description = "Multi-server Discord LoFi music bot with Spotify playlist integration, mod-channel controls, and automatic 24/7 radio fallback."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["E501", "S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+files = ["src", "tests"]
