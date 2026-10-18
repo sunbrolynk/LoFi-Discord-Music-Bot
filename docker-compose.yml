@@ -9,6 +9,7 @@ services:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
       - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://lofi.radio}
+      - BACKUP_FALLBACK_STREAM_URLS=${BACKUP_FALLBACK_STREAM_URLS:-https://stream.laut.fm/lofi}
       - DATABASE_PATH=/app/data/lofi_bot.db
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:

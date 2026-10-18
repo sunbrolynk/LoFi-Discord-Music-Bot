@@ -49,6 +49,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 
 1. Invite the bot to your Discord server.
 2. Run `/setup voice_channel:#lofi-radio control_channel:#bot-control` (requires **Manage Server** permission).
+   If `#bot-control` is private, add the bot to it with **View Channel**, **Send Messages** and **Embed Links**. Without them the bot can't post its status notices there and logs one line saying so: `Can't post notices to mod channel ...`.
 3. Go to `#bot-control` and add music:
 
         /playlist add spotify_url:https://open.spotify.com/playlist/37i9dQZF1DWWQRwui0ExPn
@@ -81,6 +82,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
               - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
               - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
               - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://lofi.radio}
+              - BACKUP_FALLBACK_STREAM_URLS=${BACKUP_FALLBACK_STREAM_URLS:-https://stream.laut.fm/lofi}
               - DATABASE_PATH=/app/data/lofi_bot.db
               - LOG_LEVEL=${LOG_LEVEL:-INFO}
             volumes:
@@ -93,7 +95,10 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
    * `DISCORD_BOT_TOKEN` = your Discord bot token
    * `SPOTIFY_CLIENT_ID` = your Spotify Client ID
    * `SPOTIFY_CLIENT_SECRET` = your Spotify Client Secret
-   * `DEFAULT_FALLBACK_STREAM_URL` = `https://lofi.radio` *(optional override)*
+   * `DEFAULT_FALLBACK_STREAM_URL` = `https://lofi.radio` *(optional override; new servers start with it, `/fallback config` changes one server)*
+   * `BACKUP_FALLBACK_STREAM_URLS` = `https://stream.laut.fm/lofi` *(optional; comma-separated stations tried in order when a server's own fallback is down)*
+
+   Before playing a fallback station the bot checks it. A station that answers 404 or doesn't answer is skipped for 30 minutes and logged once. If every backup is down, they all get checked again rather than going silent.
 4. Click **Deploy the stack**.
 
 ### Updating the bot
