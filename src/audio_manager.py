@@ -430,10 +430,11 @@ class AudioManager:
         now = time.monotonic()
         self._failed_media = {k: v for k, v in self._failed_media.items() if v > now}
         until = now + FAILED_MEDIA_TTL_SECONDS
+        loop = asyncio.get_running_loop()
 
-        # Called from the worker thread as each page fails, so a timeout keeps what it learned
+        # Runs in the worker thread as each page fails; the write happens on the event loop
         def remember(page: str) -> None:
-            self._failed_media[page] = until
+            loop.call_soon_threadsafe(self._failed_media.__setitem__, page, until)
 
         return await asyncio.wait_for(
             asyncio.to_thread(
