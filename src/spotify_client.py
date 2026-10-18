@@ -1,20 +1,29 @@
-"""Spotify URL parser and async metadata resolver."""
+"""Spotify URL parser and async metadata resolver with public embed fallback."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 from typing import Any
 
+import aiohttp
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
 from src.database import TrackMetadata
 
+logger = logging.getLogger(__name__)
+
 SPOTIFY_URL_RE = re.compile(
     r"https?://open\.spotify\.com/(?:intl-[a-zA-Z\-]+/)?(track|album|playlist)/([a-zA-Z0-9]+)"
 )
 SPOTIFY_URI_RE = re.compile(r"spotify:(track|album|playlist):([a-zA-Z0-9]+)")
+NEXT_DATA_RE = re.compile(
+    r"<script[^>]+id=[\"']__NEXT_DATA__[\"'][^>]*>(.*?)</script>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def parse_spotify_url(url_or_uri: str) -> tuple[str, str]:
@@ -56,6 +65,60 @@ def _extract_track_metadata(item: dict[str, Any]) -> TrackMetadata | None:
     )
 
 
+def extract_tracks_from_embed_html(html: str, default_url: str = "") -> list[TrackMetadata]:
+    """Extract tracks from a Spotify public embed page's __NEXT_DATA__ JSON payload."""
+    match = NEXT_DATA_RE.search(html)
+    if not match:
+        return []
+
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    entity = (
+        payload.get("props", {})
+        .get("pageProps", {})
+        .get("state", {})
+        .get("data", {})
+        .get("entity", {})
+    )
+    if not isinstance(entity, dict):
+        return []
+
+    results: list[TrackMetadata] = []
+    track_list = entity.get("trackList")
+    if isinstance(track_list, list):
+        for entry in track_list:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title") or "").strip()
+            artist = str(entry.get("subtitle") or "").strip().replace("\xa0", " ")
+            if not title:
+                continue
+            uri = str(entry.get("uri") or "")
+            track_id = uri.split(":")[-1] if ":" in uri else ""
+            spotify_url = f"https://open.spotify.com/track/{track_id}" if track_id else default_url
+            duration_ms = int(entry.get("duration") or 0)
+            results.append(
+                TrackMetadata(
+                    spotify_url=spotify_url,
+                    title=title,
+                    artist=artist or "Unknown Artist",
+                    duration_ms=duration_ms,
+                )
+            )
+        return results
+
+    # Single track embed fallback
+    if entity.get("type") == "track" and entity.get("name"):
+        meta = _extract_track_metadata(entity)
+        if meta:
+            results.append(meta)
+
+    return results
+
+
 class SpotifyResolver:
     """Resolves Spotify tracks, albums, and playlists into TrackMetadata objects."""
 
@@ -67,7 +130,7 @@ class SpotifyResolver:
         self._client = spotipy.Spotify(auth_manager=auth_manager)
 
     def _resolve_sync(self, entity_type: str, spotify_id: str) -> list[TrackMetadata]:
-        """Synchronously fetch metadata from Spotify (invoked via asyncio.to_thread)."""
+        """Synchronously fetch metadata from Spotify Web API (invoked via asyncio.to_thread)."""
         results: list[TrackMetadata] = []
 
         if entity_type == "track":
@@ -92,26 +155,64 @@ class SpotifyResolver:
             return results
 
         if entity_type == "playlist":
-            playlist_page = self._client.playlist_items(
-                spotify_id,
-                additional_types=("track",),
+            # Use the February 2026 /playlists/{id}/items endpoint
+            page = self._client._get(
+                f"playlists/{spotify_id}/items",
+                limit=100,
+                offset=0,
+                additional_types="track",
             )
-            while playlist_page:
-                for entry in playlist_page.get("items", []):
-                    track_obj = (entry or {}).get("track")
+            while page:
+                for entry in page.get("items", []):
+                    track_obj = (entry or {}).get("item") or (entry or {}).get("track")
                     if isinstance(track_obj, dict):
                         meta = _extract_track_metadata(track_obj)
                         if meta:
                             results.append(meta)
-                if playlist_page.get("next"):
-                    playlist_page = self._client.next(playlist_page)
+                if page.get("next"):
+                    page = self._client.next(page)
                 else:
                     break
             return results
 
         raise ValueError(f"Unsupported entity type: {entity_type}")
 
+    async def _resolve_via_embed(
+        self,
+        entity_type: str,
+        spotify_id: str,
+    ) -> list[TrackMetadata]:
+        """Fallback to Spotify's public embed page when Dev Mode blocks playlist reads with 403."""
+        embed_url = f"https://open.spotify.com/embed/{entity_type}/{spotify_id}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        }
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(embed_url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Spotify embed fallback returned HTTP {resp.status}")
+                html = await resp.text()
+        return extract_tracks_from_embed_html(
+            html,
+            default_url=f"https://open.spotify.com/{entity_type}/{spotify_id}",
+        )
+
     async def resolve_url(self, url_or_uri: str) -> list[TrackMetadata]:
         """Parse and resolve a Spotify URL/URI into a list of TrackMetadata."""
         entity_type, spotify_id = parse_spotify_url(url_or_uri)
-        return await asyncio.to_thread(self._resolve_sync, entity_type, spotify_id)
+        try:
+            tracks = await asyncio.to_thread(self._resolve_sync, entity_type, spotify_id)
+            if tracks:
+                return tracks
+        except Exception as exc:
+            logger.warning(
+                "Spotify API returned error for %s/%s (%s); falling back to public embed.",
+                entity_type,
+                spotify_id,
+                exc,
+            )
+        return await self._resolve_via_embed(entity_type, spotify_id)

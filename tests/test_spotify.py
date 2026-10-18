@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import pytest
-from src.spotify_client import _extract_track_metadata, parse_spotify_url
+from src.spotify_client import (
+    _extract_track_metadata,
+    extract_tracks_from_embed_html,
+    parse_spotify_url,
+)
 
 
 def test_parse_spotify_urls_and_uris() -> None:
@@ -46,3 +50,19 @@ def test_extract_track_metadata_handles_valid_and_local_items() -> None:
     assert meta.duration_ms == 142000
 
     assert _extract_track_metadata({"is_local": True, "name": "Local File"}) is None
+
+
+def test_extract_tracks_from_embed_html() -> None:
+    """Ensure public Spotify embed __NEXT_DATA__ JSON parses into TrackMetadata."""
+    sample_html = (
+        '<script id="__NEXT_DATA__" type="application/json">'
+        '{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":['
+        '{"uri":"spotify:track:4cOdK2wGLETKBW3PvgPWqT","title":"Midnight Coffee",'
+        '"subtitle":"Purrple Cat","duration":145000}]}}}}}}'
+        "</script>"
+    )
+    tracks = extract_tracks_from_embed_html(sample_html)
+    assert len(tracks) == 1
+    assert tracks[0].title == "Midnight Coffee"
+    assert tracks[0].artist == "Purrple Cat"
+    assert tracks[0].spotify_url == "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
