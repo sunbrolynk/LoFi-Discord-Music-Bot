@@ -18,6 +18,8 @@
 * **Mod-Channel Command Lockdown**: Once a server's channels are bound via `/setup`, bot commands are strictly restricted to that server's mod control text channel.
 * **Spotify Track, Album & Playlist Resolution**: Add individual songs, full albums, or entire playlists at any time using `/playlist add <spotify_url>`.
 * **Configurable 24/7 Fallback Stream**: Automatically switches to a 24/7 LoFi radio stream if a track fails to resolve (`on_error`), when a playlist finishes (`on_empty`), both (`on_empty_and_error`), or only when manually triggered (`manual_only`). Jump right back into your custom playlist anytime with `/playlist resume`.
+* **Self-Healing 24/7 Playback**: If the voice connection drops, a stream dies, or a track can't be found, the bot reconnects and retries with backoff (5s up to 5 minutes) instead of going quiet. A watchdog restarts any server that should be playing but has been silent for 90 seconds, and after a container restart the bot rejoins and resumes every server that was playing. `/stop` is the only thing that keeps it off.
+* **Logs and Healthcheck**: Logs go to stdout (Portainer's log view) and to rotating files in `/app/data/logs/bot.log` (5 MB x 6 files) on the data volume, so they survive restarts. The container reports `unhealthy` when the bot loses Discord or a server has been silent for 10 minutes.
 * **Defense-in-Depth Security & Push Gates**: Every dependency in `requirements.txt` and `requirements-dev.txt` is locked with SHA-256 hashes (`--require-hashes`), and local Git hooks (`pre-commit` and `pre-push`) block leaked secrets, enforce Ruff linting/formatting and Mypy type checks, and run the Pytest unit test suite before any code leaves your machine.
 
 ## Slash Command Reference
@@ -36,7 +38,8 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 | `/fallback start` | None | Manually switches this server to the 24/7 fallback LoFi stream immediately. |
 | `/play` | None | Starts or unpauses playback in this server's configured voice channel. |
 | `/pause` | None | Pauses active audio playback. |
-| `/skip` | None | Skips to the next track in this server's playlist. |
+| `/search` | `query` | Searches Spotify for a song and queues it to play next, ahead of the playlist. Plays it right away if nothing from the playlist is playing. The queue isn't saved across restarts. |
+| `/skip` | None | Skips to the next queued song, or the next track in this server's playlist. |
 | `/stop` | None | Stops playback and disconnects the bot from this server's voice channel. |
 | `/mode` | `loop` (`playlist`, `track`, `off`), `shuffle` (`true`/`false`) | Updates loop and shuffle behavior for this server's playlist. |
 | `/volume` | `level` (`1`–`100`) | Sets and saves the playback volume percentage for this server. |
@@ -72,7 +75,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
             image: ghcr.io/sunbrolynk/lofi-discord-music-bot:latest
             container_name: lofi-discord-music-bot
             restart: unless-stopped
-            user: 0:0s
+            user: "0:0"
             environment:
               - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
               - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
@@ -92,6 +95,20 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
    * `SPOTIFY_CLIENT_SECRET` = your Spotify Client Secret
    * `DEFAULT_FALLBACK_STREAM_URL` = `https://lofi.radio` *(optional override)*
 4. Click **Deploy the stack**.
+
+### Updating the bot
+
+1. Merge to `main` and wait for the **CI & Publish Container to GHCR** workflow to go green.
+2. In Portainer, open the `lofi-discord-music-bot` stack, click **Editor**, and check it matches `docker-compose.yml` above.
+3. Click **Update the stack** with **Re-pull image and redeploy** turned on. A plain container restart keeps the old image.
+
+### Reading the logs
+
+* Live: Portainer -> **Containers** -> `lofi-discord-music-bot` -> **Logs**.
+* History: `docker exec lofi-discord-music-bot tail -n 200 /app/data/logs/bot.log`, or the **Console** tab in Portainer. Older files are `bot.log.1` to `bot.log.5`.
+* Set `LOG_LEVEL=DEBUG` in the stack's environment variables for voice-connection detail from discord.py.
+
+Lines to look for when playback stops: `Recovering playback`, `Stream resolve attempt`, `Stream ended with error`, and anything from `discord.voice_state`.
 
 ## Complete Rebuild-From-Scratch Guide (Disaster Recovery)
 
@@ -143,7 +160,7 @@ If you ever need to rebuild the credentials, local WSL workspace, or deployment 
 
     # 5. (Optional) Run locally in WSL
     cp .env.example .env
-    # Edit .env with your real credentials, then start:s
+    # Edit .env with your real credentials, then start:
     python -m src.bot
 
 ### 4. Updating Dependencies Safely in the Future

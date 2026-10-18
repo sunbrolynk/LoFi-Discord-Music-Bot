@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.audio_manager import AudioManager
-from src.database import DatabaseManager
+from src.database import DatabaseManager, PlaylistTrack
 from src.spotify_client import SpotifyResolver
 
 TRACKS_PER_PAGE = 10
@@ -382,8 +382,46 @@ class MusicCommandsCog(commands.Cog):
             return
         assert interaction.guild is not None
 
+        await interaction.response.defer()
         await self.audio.stop_and_disconnect(interaction.guild)
-        await interaction.response.send_message("⏹️ Stopped playback and disconnected.")
+        await interaction.followup.send("⏹️ Stopped playback and disconnected.")
+
+    @app_commands.command(
+        name="search",
+        description="Search for a song and queue it to play next.",
+    )
+    async def search_cmd(
+        self,
+        interaction: discord.Interaction,
+        query: app_commands.Range[str, 1, 200],
+    ) -> None:
+        """Find a song on Spotify and queue it ahead of the playlist."""
+        if not await self._require_mod_channel(interaction):
+            return
+        assert interaction.guild is not None
+
+        await interaction.response.defer()
+        try:
+            track = await self.spotify.search_track(query)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ Search failed: {exc}")
+            return
+        if track is None:
+            await interaction.followup.send(f"⚠️ No song found for `{query}`.")
+            return
+
+        try:
+            slot = await self.audio.enqueue(interaction.guild, track)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ Could not queue **{track.title}**: {exc}")
+            return
+        label = f"**{track.title}** — {track.artist}"
+        if slot == 0 and self.audio.get_active_track(interaction.guild.id) is track:
+            await interaction.followup.send(f"▶️ Now playing {label}.")
+        elif slot == 0:
+            await interaction.followup.send(f"⚠️ Couldn't stream {label}.")
+        else:
+            await interaction.followup.send(f"➕ Queued {label} (#{slot} in the queue).")
 
     @app_commands.command(
         name="mode",
@@ -446,15 +484,17 @@ class MusicCommandsCog(commands.Cog):
             if settings.on_fallback
             else "🎶 Custom Server Playlist"
         )
-        now_playing = (
-            f"`{settings.fallback_url}`"
-            if settings.on_fallback
-            else (
+        if settings.on_fallback:
+            now_playing = f"`{settings.fallback_url}`"
+        elif isinstance(active, PlaylistTrack):
+            now_playing = (
                 f"**{active.title}** — {active.artist} (`#{active.position}/{len(playlist)}`)"
-                if active
-                else "Stopped / Idle"
             )
-        )
+        elif active:
+            now_playing = f"**{active.title}** — {active.artist} (searched)"
+        else:
+            now_playing = "Stopped / Idle"
+        queued = self.audio.queue_length(interaction.guild.id)
         voice_mention = (
             f"<#{settings.voice_channel_id}>" if settings.voice_channel_id else "Not set"
         )
@@ -472,7 +512,7 @@ class MusicCommandsCog(commands.Cog):
         embed.add_field(name="Mod Channel", value=control_mention, inline=True)
         embed.add_field(
             name="Saved Tracks",
-            value=f"{len(playlist)} track(s)",
+            value=f"{len(playlist)} track(s), {queued} queued",
             inline=True,
         )
         embed.add_field(
