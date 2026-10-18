@@ -1,6 +1,6 @@
 discord.py[voice]==2.7.1
 PyNaCl==1.5.0
 spotipy==2.24.0
-yt-dlp
+yt-dlp==2026.8.19
 aiosqlite==0.20.0
 python-dotenv==1.0.1
