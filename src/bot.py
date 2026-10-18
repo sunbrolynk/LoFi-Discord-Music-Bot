@@ -37,7 +37,11 @@ class LoFiBot(commands.Bot):
         self.audio = AudioManager(bot=self, db=self.db)
 
     async def setup_hook(self) -> None:
-        """Initialize the SQLite database, register cogs, and sync slash commands."""
+        """Initialize Opus, the SQLite database, register cogs, and sync slash commands."""
+        if not discord.opus.is_loaded():
+            discord.opus.load_opus("libopus.so.0")
+        logger.info("Opus loaded: %s", discord.opus.is_loaded())
+
         await self.db.init_db()
         await self.add_cog(
             MusicCommandsCog(

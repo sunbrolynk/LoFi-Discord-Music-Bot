@@ -5,9 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install FFmpeg and voice encryption system libraries
+# Install FFmpeg, Opus codec, and voice encryption system libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    libopus0 \
+    libopus-dev \
     libffi-dev \
     libnacl-dev \
     libsodium23 \
