@@ -72,6 +72,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
             image: ghcr.io/sunbrolynk/lofi-discord-music-bot:latest
             container_name: lofi-discord-music-bot
             restart: unless-stopped
+            user; 0:0s
             environment:
               - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
               - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
