@@ -55,6 +55,7 @@ class GuildSettings:
     current_index: int
     on_fallback: bool
     fallback_reason: str
+    autoplay: bool = False
 
 
 class DatabaseManager:
@@ -105,6 +106,12 @@ class DatabaseManager:
                 ON guild_playlist_tracks (guild_id, position)
                 """
             )
+            cursor = await db.execute("PRAGMA table_info(guild_settings)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            if "autoplay" not in columns:
+                await db.execute(
+                    "ALTER TABLE guild_settings ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
+                )
             await db.commit()
 
     async def get_guild_settings(self, guild_id: int) -> GuildSettings:
@@ -150,6 +157,7 @@ class DatabaseManager:
                 current_index=int(row["current_index"]),
                 on_fallback=bool(row["on_fallback"]),
                 fallback_reason=str(row["fallback_reason"]),
+                autoplay=bool(row["autoplay"]),
             )
 
     async def set_channels(
@@ -247,6 +255,16 @@ class DatabaseManager:
             )
             await db.commit()
         return await self.get_guild_settings(guild_id)
+
+    async def set_autoplay(self, guild_id: int, enabled: bool) -> None:
+        """Record whether the bot should keep this guild playing, including after a restart."""
+        await self.get_guild_settings(guild_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE guild_settings SET autoplay = ? WHERE guild_id = ?",
+                (int(enabled), guild_id),
+            )
+            await db.commit()
 
     async def set_current_index(self, guild_id: int, index: int) -> None:
         """Update the saved playlist cursor index for a guild."""

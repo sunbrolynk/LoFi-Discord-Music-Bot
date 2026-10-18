@@ -204,6 +204,15 @@ class SpotifyResolver:
             default_url=f"https://open.spotify.com/{entity_type}/{spotify_id}",
         )
 
+    def _search_sync(self, query: str) -> TrackMetadata | None:
+        result = self._client.search(q=query, limit=1, type="track")
+        items = ((result or {}).get("tracks") or {}).get("items") or []
+        return _extract_track_metadata(items[0]) if items else None
+
+    async def search_track(self, query: str) -> TrackMetadata | None:
+        """Return the best Spotify match for a free-text song search, or None."""
+        return await asyncio.to_thread(self._search_sync, query)
+
     async def resolve_url(self, url_or_uri: str) -> list[TrackMetadata]:
         """Parse and resolve a Spotify URL/URI into a list of TrackMetadata."""
         entity_type, spotify_id = parse_spotify_url(url_or_uri)
