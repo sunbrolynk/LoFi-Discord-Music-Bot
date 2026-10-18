@@ -76,7 +76,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
               - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
               - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
               - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-              - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://streams.ilovemusic.de/iloveradio17.mp3}
+              - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://lofi.radio}
               - DATABASE_PATH=/app/data/lofi_bot.db
               - LOG_LEVEL=${LOG_LEVEL:-INFO}
             volumes:
@@ -89,7 +89,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
    * `DISCORD_BOT_TOKEN` = your Discord bot token
    * `SPOTIFY_CLIENT_ID` = your Spotify Client ID
    * `SPOTIFY_CLIENT_SECRET` = your Spotify Client Secret
-   * `DEFAULT_FALLBACK_STREAM_URL` = `https://streams.ilovemusic.de/iloveradio17.mp3` *(optional override)*
+   * `DEFAULT_FALLBACK_STREAM_URL` = `https://lofi.radio` *(optional override)*
 4. Click **Deploy the stack**.
 
 ## Complete Rebuild-From-Scratch Guide (Disaster Recovery)

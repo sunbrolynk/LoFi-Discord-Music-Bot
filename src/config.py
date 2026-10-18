@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-DEFAULT_RADIO_URL = "https://streams.ilovemusic.de/iloveradio17.mp3"
+DEFAULT_RADIO_URL = "https://lofi.radio"
 
 
 @dataclass(frozen=True)

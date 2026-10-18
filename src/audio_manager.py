@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from typing import Any
+from urllib.parse import urljoin
 
+import aiohttp
 import discord
 import yt_dlp
 
@@ -26,6 +29,24 @@ YTDL_OPTIONS: dict[str, Any] = {
     "source_address": "0.0.0.0",  # noqa: S104
 }
 
+AUDIO_FILE_RE = re.compile(
+    r"[\"'\`]([^\"'\`\s<>]+?\.(?:mp3|ogg|m4a)(?:\?[^\"'\`\s<>]*)?)[\"'\`]",
+    re.IGNORECASE,
+)
+SCRIPT_SRC_RE = re.compile(
+    r"<script[^>]+src=[\"'\`]([^\"'\`]+\.js(?:\?[^\"'\`]*)?)[\"'\`]",
+    re.IGNORECASE,
+)
+
+LOFI_RADIO_QUERIES = [
+    "Purrple Cat - Aurora lofi audio",
+    "Purrple Cat - Midnight Tea lofi audio",
+    "Purrple Cat - Starlight lofi audio",
+    "Purrple Cat - Cozy Place lofi audio",
+    "Purrple Cat - Crescent Moon lofi audio",
+    "Purrple Cat - Wishing Well lofi audio",
+]
+
 
 def should_fallback_on_empty(triggers: str) -> bool:
     """Return True if fallback should activate when the playlist is empty or finishes."""
@@ -35,6 +56,16 @@ def should_fallback_on_empty(triggers: str) -> bool:
 def should_fallback_on_error(triggers: str) -> bool:
     """Return True if fallback should activate when a track fails to stream."""
     return triggers in {"on_empty_and_error", "on_error_only"}
+
+
+def extract_audio_urls_from_text(text: str, base_url: str) -> list[str]:
+    """Extract and normalize direct audio file URLs (.mp3/.ogg/.m4a) from HTML or JS."""
+    found: list[str] = []
+    for match in AUDIO_FILE_RE.findall(text):
+        full_url = urljoin(base_url, match)
+        if full_url.startswith(("http://", "https://")) and full_url not in found:
+            found.append(full_url)
+    return found
 
 
 def compute_next_index(
@@ -67,7 +98,12 @@ def compute_next_index(
 def _extract_stream_url_sync(search_query: str) -> str:
     """Extract a direct audio stream URL via yt-dlp (runs in worker thread)."""
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
+        target_arg = (
+            search_query
+            if search_query.startswith(("http://", "https://"))
+            else f"ytsearch1:{search_query}"
+        )
+        info = ydl.extract_info(target_arg, download=False)
         if not info:
             raise RuntimeError(f"No stream info returned for query: {search_query}")
         entries = info.get("entries")
@@ -86,6 +122,7 @@ class AudioManager:
         self.db = db
         self._active_tracks: dict[int, PlaylistTrack | None] = {}
         self._locks: dict[int, asyncio.Lock] = {}
+        self._lofi_radio_cache: list[str] = []
 
     def _get_lock(self, guild_id: int) -> asyncio.Lock:
         if guild_id not in self._locks:
@@ -135,6 +172,51 @@ class AudioManager:
 
         return await channel.connect(self_deaf=True)
 
+    async def _resolve_fallback_stream_url(self, fallback_url: str) -> str:
+        """Resolve a playable stream URL from lofi.radio or a direct stream URL."""
+        cleaned = fallback_url.strip()
+        if not cleaned.startswith(("http://", "https://")):
+            cleaned = f"https://{cleaned}"
+
+        # Direct Icecast / raw audio file URL
+        if cleaned.lower().endswith((".mp3", ".ogg", ".m4a", ".aac", ".m3u8")):
+            return cleaned
+
+        # Scrape lofi.radio (or custom web radio page) for direct MP3 track URLs
+        if "lofi.radio" in cleaned.lower():
+            if self._lofi_radio_cache:
+                return self._lofi_radio_cache[secrets.randbelow(len(self._lofi_radio_cache))]
+
+            discovered: list[str] = []
+            timeout = aiohttp.ClientTimeout(total=10)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(cleaned) as resp:
+                        if resp.status == 200:
+                            html = await resp.text()
+                            discovered.extend(extract_audio_urls_from_text(html, cleaned))
+                            script_urls = [urljoin(cleaned, s) for s in SCRIPT_SRC_RE.findall(html)]
+                            for script_url in script_urls[:5]:
+                                async with session.get(script_url) as s_resp:
+                                    if s_resp.status == 200:
+                                        js_text = await s_resp.text()
+                                        for u in extract_audio_urls_from_text(js_text, cleaned):
+                                            if u not in discovered:
+                                                discovered.append(u)
+            except Exception as exc:
+                logger.warning("Could not scrape lofi.radio directly: %s", exc)
+
+            if discovered:
+                self._lofi_radio_cache = discovered
+                return discovered[secrets.randbelow(len(discovered))]
+
+            # Fallback to Purrple Cat (the official artist powering lofi.radio) via yt-dlp
+            query = LOFI_RADIO_QUERIES[secrets.randbelow(len(LOFI_RADIO_QUERIES))]
+            return await asyncio.to_thread(_extract_stream_url_sync, query)
+
+        # Any other URL (e.g. YouTube live radio stream) resolved via yt-dlp
+        return await asyncio.to_thread(_extract_stream_url_sync, cleaned)
+
     async def _resolve_with_retries(
         self,
         track: PlaylistTrack,
@@ -163,37 +245,67 @@ class AudioManager:
         self,
         guild: discord.Guild,
         reason: str = "Manual fallback activated",
+        announce: bool = True,
     ) -> None:
         """Switch a server immediately to its 24/7 fallback lofi radio stream."""
+        settings = await self.db.set_fallback_state(
+            guild.id,
+            on_fallback=True,
+            reason=reason,
+        )
+        stream_url = await self._resolve_fallback_stream_url(settings.fallback_url)
+
         async with self._get_lock(guild.id):
             voice_client = await self.ensure_voice_client(guild)
-            settings = await self.db.set_fallback_state(
-                guild.id,
-                on_fallback=True,
-                reason=reason,
-            )
             self._active_tracks[guild.id] = None
 
             if voice_client.is_playing() or voice_client.is_paused():
                 voice_client.stop()
 
             source = discord.FFmpegPCMAudio(
-                settings.fallback_url,
+                stream_url,
                 before_options=FFMPEG_BEFORE_OPTIONS,
                 options=FFMPEG_OPTIONS,
             )
             transformed = discord.PCMVolumeTransformer(source, volume=settings.volume)
-            voice_client.play(transformed)
 
-        await self.notify_control_channel(
-            guild,
-            title="🌙 Switched to 24/7 Fallback LoFi Stream",
-            description=(
-                f"**Reason:** {reason}\n"
-                f"**Stream URL:** `{settings.fallback_url}`\n"
-                "Run `/playlist resume` in this channel anytime to jump back to your playlist."
-            ),
-        )
+            def _after_fallback(error: Exception | None) -> None:
+                if error:
+                    logger.warning("Fallback stream ended with error in %s: %s", guild.id, error)
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_fallback_track_finished(guild),
+                    self.bot.loop,
+                )
+
+            voice_client.play(transformed, after=_after_fallback)
+
+        if announce:
+            await self.notify_control_channel(
+                guild,
+                title="🌙 Switched to 24/7 Fallback LoFi Stream",
+                description=(
+                    f"**Reason:** {reason}\n"
+                    f"**Radio Source:** `{settings.fallback_url}`\n"
+                    "Run `/playlist resume` in this channel anytime to jump back to your playlist."
+                ),
+            )
+
+    async def _handle_fallback_track_finished(self, guild: discord.Guild) -> None:
+        """Automatically queue the next lofi.radio track while the server remains on fallback."""
+        settings = await self.db.get_guild_settings(guild.id)
+        if not settings.on_fallback:
+            return
+        voice_client = guild.voice_client
+        if not isinstance(voice_client, discord.VoiceClient) or not voice_client.is_connected():
+            return
+        try:
+            await self.start_fallback(
+                guild,
+                reason=settings.fallback_reason or "24/7 Fallback Radio",
+                announce=False,
+            )
+        except Exception as exc:
+            logger.error("Failed to loop fallback stream in guild %s: %s", guild.id, exc)
 
     async def play_playlist_index(
         self,

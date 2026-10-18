@@ -7,7 +7,7 @@ services:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-      - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://streams.ilovemusic.de/iloveradio17.mp3}
+      - DEFAULT_FALLBACK_STREAM_URL=${DEFAULT_FALLBACK_STREAM_URL:-https://lofi.radio}
       - DATABASE_PATH=/app/data/lofi_bot.db
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
