@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import re
@@ -10,7 +11,7 @@ import secrets
 import sys
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 from urllib.parse import urljoin
 
@@ -174,6 +175,16 @@ class AudioManager:
         self._recovery_attempts: dict[int, int] = {}
         self._recovery_tasks: dict[int, asyncio.Task[None]] = {}
         self._background: set[asyncio.Task[None]] = set()
+        self._in_flight: dict[int, int] = {}
+
+    @contextlib.contextmanager
+    def _starting(self, guild_id: int) -> Iterator[None]:
+        """Mark a lookup-and-play as in flight so recovery doesn't start a second one."""
+        self._in_flight[guild_id] = self._in_flight.get(guild_id, 0) + 1
+        try:
+            yield
+        finally:
+            self._in_flight[guild_id] -= 1
 
     def _get_lock(self, guild_id: int) -> asyncio.Lock:
         if guild_id not in self._locks:
@@ -423,7 +434,11 @@ class AudioManager:
                     reason,
                 )
                 await asyncio.sleep(delay)
-                if guild_id not in self._wanted or self._voice_busy(guild):
+                if (
+                    guild_id not in self._wanted
+                    or self._voice_busy(guild)
+                    or self._in_flight.get(guild_id, 0)
+                ):
                     return
                 try:
                     await self.resume_from_state(guild)
@@ -496,6 +511,16 @@ class AudioManager:
         force_direct_icecast: bool = False,
     ) -> None:
         """Switch a server immediately to its 24/7 fallback lofi radio stream."""
+        with self._starting(guild.id):
+            await self._start_fallback(guild, reason, announce, force_direct_icecast)
+
+    async def _start_fallback(
+        self,
+        guild: discord.Guild,
+        reason: str,
+        announce: bool,
+        force_direct_icecast: bool,
+    ) -> None:
         await self._set_wanted(guild.id, True)
         settings = await self.db.set_fallback_state(
             guild.id,
@@ -573,6 +598,16 @@ class AudioManager:
         on_end: EndHandler,
     ) -> bool:
         """Resolve and play one track, or fall back to radio; return whether audio started."""
+        with self._starting(guild.id):
+            return await self._resolve_and_play(guild, track, settings, on_end)
+
+    async def _resolve_and_play(
+        self,
+        guild: discord.Guild,
+        track: ActiveTrack,
+        settings: GuildSettings,
+        on_end: EndHandler,
+    ) -> bool:
         try:
             stream_url = await self._resolve_with_retries(track)
         except Exception as exc:

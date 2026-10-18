@@ -312,3 +312,26 @@ async def test_recovery_leaves_already_recovered_playback_alone(setup: Any) -> N
     manager.schedule_recovery(guild, "test")
     await settle()
     assert guild.voice_client.plays == ["https://cdn.example/Song_A"]
+
+
+async def test_recovery_waits_out_an_in_flight_lookup(setup: Any, monkeypatch: Any) -> None:
+    manager, guild, _ = setup
+    release = asyncio.Event()
+    lookups: list[str] = []
+    resolve = manager._extract_stream_url
+
+    async def slow(query: str) -> str:
+        lookups.append(query)
+        await release.wait()
+        return str(await resolve(query))
+
+    monkeypatch.setattr(manager, "_extract_stream_url", slow)
+    play = asyncio.create_task(manager.play_playlist_index(guild, index=0))
+    await settle()
+    manager.schedule_recovery(guild, "silent while the lookup runs")
+    await settle()
+    release.set()
+    await play
+    await settle()
+    assert lookups == ["Cat - Song A"]
+    assert guild.voice_client.plays == ["https://cdn.example/Song_A"]
