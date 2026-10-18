@@ -23,7 +23,7 @@ class LoFiBot(commands.Bot):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.voice_states = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
 
         self.config = config
         self.db = DatabaseManager(
