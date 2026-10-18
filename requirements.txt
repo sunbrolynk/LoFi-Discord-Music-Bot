@@ -1082,9 +1082,9 @@ requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
     --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
     # via spotipy
-spotipy==2.24.0 \
-    --hash=sha256:396af81e642086551af157270cdfe742c1739405871ba9dac1fa651b8649ef0d \
-    --hash=sha256:c5aa7338c624a05a8a80dcf9c6761ded3d6bc2bc5df5f22d9398a895b11bd2ae
+spotipy==2.26.0 \
+    --hash=sha256:2726854ddfa0e5624aada592e737832ec75bdc00ae12c102779f8bd995329d49 \
+    --hash=sha256:df6a25d8209072efa8cea165608ee644884e3804f8762b6d8e06ca1a5c7f8a63
     # via -r requirements.in
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
