@@ -16,14 +16,14 @@ repos:
         entry: .venv/bin/ruff check --fix
         language: system
         types: [python]
-        stages: [pre-commit]
+        stages: [pre-commit, pre-push]
 
       - id: ruff-format
         name: Ruff Formatter Check
         entry: .venv/bin/ruff format
         language: system
         types: [python]
-        stages: [pre-commit]
+        stages: [pre-commit, pre-push]
 
       - id: mypy-typecheck
         name: Mypy Static Type Check
@@ -31,7 +31,7 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
-        stages: [pre-commit]
+        stages: [pre-commit, pre-push]
 
       - id: pytest-pre-push
         name: Pytest Suite (Pre-Push Gate)

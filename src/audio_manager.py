@@ -25,7 +25,7 @@ FFMPEG_OPTIONS = "-vn"
 # Direct 24/7 Icecast LoFi stream used if a scraped web track ever fails
 DIRECT_ICECAST_LOFI_URL = "https://stream.laut.fm/lofi"
 
-YTDL_OPTIONS: dict[str, Any] = {
+YTDL_OPTIONS: Any = {
     "format": "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,

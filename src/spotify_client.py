@@ -42,7 +42,7 @@ def parse_spotify_url(url_or_uri: str) -> tuple[str, str]:
     )
 
 
-def _extract_track_metadata(item: dict[str, Any]) -> TrackMetadata | None:
+def _extract_track_metadata(item: dict[str, Any] | None) -> TrackMetadata | None:
     """Convert a raw Spotipy track dict into a TrackMetadata object."""
     if not item or item.get("is_local"):
         return None
@@ -135,19 +135,23 @@ class SpotifyResolver:
 
         if entity_type == "track":
             raw_track = self._client.track(spotify_id)
-            meta = _extract_track_metadata(raw_track)
-            if meta:
-                results.append(meta)
+            if isinstance(raw_track, dict):
+                meta = _extract_track_metadata(raw_track)
+                if meta:
+                    results.append(meta)
             return results
 
         if entity_type == "album":
             album_info = self._client.album(spotify_id)
+            if not isinstance(album_info, dict):
+                return results
             tracks_page = album_info.get("tracks")
-            while tracks_page:
+            while isinstance(tracks_page, dict):
                 for item in tracks_page.get("items", []):
-                    meta = _extract_track_metadata(item)
-                    if meta:
-                        results.append(meta)
+                    if isinstance(item, dict):
+                        meta = _extract_track_metadata(item)
+                        if meta:
+                            results.append(meta)
                 if tracks_page.get("next"):
                     tracks_page = self._client.next(tracks_page)
                 else:
@@ -155,14 +159,13 @@ class SpotifyResolver:
             return results
 
         if entity_type == "playlist":
-            # Use the February 2026 /playlists/{id}/items endpoint
             page = self._client._get(
                 f"playlists/{spotify_id}/items",
                 limit=100,
                 offset=0,
                 additional_types="track",
             )
-            while page:
+            while isinstance(page, dict):
                 for entry in page.get("items", []):
                     track_obj = (entry or {}).get("item") or (entry or {}).get("track")
                     if isinstance(track_obj, dict):
