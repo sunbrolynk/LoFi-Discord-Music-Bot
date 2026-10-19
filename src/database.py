@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,6 +105,25 @@ class DatabaseManager:
                 """
                 CREATE INDEX IF NOT EXISTS idx_playlist_guild_pos
                 ON guild_playlist_tracks (guild_id, position)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resolve_cache (
+                    track_key TEXT PRIMARY KEY,
+                    source_page TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bad_sources (
+                    source_id TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    bad_until REAL NOT NULL
+                )
                 """
             )
             cursor = await db.execute("PRAGMA table_info(guild_settings)")
@@ -383,3 +403,56 @@ class DatabaseManager:
             )
             await db.commit()
             return cursor.rowcount if cursor.rowcount is not None else 0
+
+    async def get_cached_source(self, track_key: str) -> tuple[str, str] | None:
+        """Return the (page, source_id) that last played this track, if any."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT source_page, source_id FROM resolve_cache WHERE track_key = ?",
+                (track_key,),
+            )
+            row = await cursor.fetchone()
+            return (str(row[0]), str(row[1])) if row else None
+
+    async def set_cached_source(self, track_key: str, page: str, source_id: str) -> None:
+        """Remember the source that played this track."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO resolve_cache (track_key, source_page, source_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(track_key) DO UPDATE SET
+                    source_page = excluded.source_page,
+                    source_id = excluded.source_id,
+                    updated_at = excluded.updated_at
+                """,
+                (track_key, page, source_id, time.time()),
+            )
+            await db.commit()
+
+    async def delete_cached_source(self, track_key: str) -> None:
+        """Forget the cached source for a track."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM resolve_cache WHERE track_key = ?", (track_key,))
+            await db.commit()
+
+    async def add_bad_source(self, source_id: str, reason: str, bad_until: float) -> None:
+        """Keep a source that failed out of searches until `bad_until` (epoch seconds)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO bad_sources (source_id, reason, bad_until) VALUES (?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    reason = excluded.reason, bad_until = excluded.bad_until
+                """,
+                (source_id, reason[:500], bad_until),
+            )
+            await db.commit()
+
+    async def get_bad_sources(self, now: float) -> set[str]:
+        """Return sources still marked bad, dropping the expired ones."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM bad_sources WHERE bad_until <= ?", (now,))
+            await db.commit()
+            cursor = await db.execute("SELECT source_id FROM bad_sources")
+            return {str(row[0]) for row in await cursor.fetchall()}
