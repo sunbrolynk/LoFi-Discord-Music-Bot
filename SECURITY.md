@@ -5,7 +5,7 @@
 If you find a security problem in the LoFi Discord Music Bot, report it
 privately rather than in a public issue.
 
-**Email:** [swagar003@gmail.com](mailto:swagar003@gmail.com)
+**Email:** [admin@audiobookmanager.com](mailto:admin@audiobookmanager.com)
 
 You can also use GitHub's
 [private vulnerability reporting](https://github.com/sunbrolynk/LoFi-Discord-Music-Bot/security/advisories/new).

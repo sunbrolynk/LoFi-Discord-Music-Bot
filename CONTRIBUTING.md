@@ -9,13 +9,16 @@ Set up the virtual environment and hooks as in the README's local development
 steps, then let the hooks run on every commit and push:
 
 - **pre-commit:** the secret scans, Ruff lint and format, and Mypy.
-- **pre-push:** the same, plus the full Pytest suite and a pip-audit of both locks.
+- **pre-push:** the same, plus the full Pytest suite, a pip-audit of both locks
+  and the changelog check.
 
 Every one has to pass; don't push with `--no-verify`. CI runs the same checks
 again on the pull request.
 
-New logic comes with tests in the same pull request. Add a `CHANGELOG.md`
-entry under `Unreleased` for anything a server running the bot would notice.
+New logic comes with tests in the same pull request. Every commit that changes
+`src/` needs a `CHANGELOG.md` entry under `Unreleased`, in it or in a later
+commit on the branch; one with no effect anyone running the bot would notice
+opts out with a `Changelog: none` trailer.
 
 ## Commit messages
 
