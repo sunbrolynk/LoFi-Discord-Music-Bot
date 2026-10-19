@@ -28,6 +28,14 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      - id: changelog
+        name: Changelog Entry for Every Source Change
+        entry: bash scripts/check-changelog.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: secret-scanner
         name: Block Secrets & Sensitive Files
         entry: .venv/bin/python scripts/check_secrets.py

@@ -179,3 +179,7 @@ Whenever you change `requirements.in` or `requirements-dev.in`, regenerate the S
     pip-compile --generate-hashes --allow-unsafe --output-file=requirements-dev.txt requirements-dev.in
     pip install --require-hashes -r requirements.txt
     pip install --require-hashes -r requirements-dev.txt
+
+## License
+
+GNU General Public License v3.0, the same as ABM. See [LICENSE](LICENSE).
