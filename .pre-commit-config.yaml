@@ -4,6 +4,30 @@ fail_fast: true
 repos:
   - repo: local
     hooks:
+      - id: clean-tree
+        name: Block a Push With Uncommitted Changes
+        entry: bash -c 'test -z "$(git status --porcelain)" || { echo "The gate tests the working tree but the push sends commits; commit or stash first." >&2; git status --short >&2; exit 1; }'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: gitleaks-staged
+        name: Gitleaks Scan of Staged Changes
+        entry: bash scripts/check-secrets.sh --staged
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: gitleaks-history
+        name: Gitleaks Scan of Every Commit
+        entry: bash scripts/check-secrets.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: secret-scanner
         name: Block Secrets & Sensitive Files
         entry: .venv/bin/python scripts/check_secrets.py
