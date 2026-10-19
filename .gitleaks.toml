@@ -1,0 +1,11 @@
+# The default gitleaks rules, minus the fake tokens the secret scanner's own tests check against.
+title = "LoFi Discord Music Bot gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixtures with fake secrets"
+paths = [
+    '''^tests/test_secret_scanner\.py$''',
+]
