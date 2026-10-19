@@ -23,6 +23,10 @@ jobs:
       - name: Scan Git history for secrets with gitleaks
         run: bash scripts/check-secrets.sh
 
+      - name: Check every source change has a changelog entry
+        if: github.event_name == 'pull_request'
+        run: bash scripts/check-changelog.sh "origin/${GITHUB_BASE_REF}..HEAD"
+
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
