@@ -158,7 +158,7 @@ If you ever need to rebuild the credentials, local WSL workspace, or deployment 
     # 3. Create the virtual environment and install hash-pinned dependencies
     python3 -m venv .venv
     source .venv/bin/activate
-    pip install "pip==24.3.1" "click==8.1.8" "pip-tools==7.4.1"
+    pip install "pip==26.2.1" "click==8.1.8" "pip-tools==7.6.2"
     pip install --require-hashes -r requirements.txt
     pip install --require-hashes -r requirements-dev.txt
 
