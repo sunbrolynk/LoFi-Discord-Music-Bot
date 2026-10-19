@@ -65,6 +65,14 @@ repos:
         pass_filenames: false
         stages: [pre-commit, pre-push]
 
+      - id: pip-audit
+        name: Pip-audit Every Lock
+        entry: bash scripts/audit-deps.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: pytest-pre-push
         name: Pytest Suite (Pre-Push Gate)
         entry: .venv/bin/pytest -v
