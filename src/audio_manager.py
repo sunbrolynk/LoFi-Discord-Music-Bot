@@ -12,15 +12,14 @@ import sys
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Sequence
-from typing import Any
 from urllib.parse import quote, urljoin
 
 import aiohttp
 import discord
-import yt_dlp
 
 from src.config import DEFAULT_BACKUP_STREAM_URLS
 from src.database import DatabaseManager, GuildSettings, PlaylistTrack, TrackMetadata
+from src.resolver import Resolved, SourcesUnreachable, TrackResolver, track_key
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +34,16 @@ VOICE_CONNECT_TIMEOUT_SECONDS = 30.0
 IDLE_RECOVERY_SECONDS = 90.0
 UNHEALTHY_IDLE_SECONDS = 600.0
 
-SEARCH_CANDIDATES = 5
-FAILED_MEDIA_TTL_SECONDS = 6 * 3600.0
+PREFETCH_COUNT = 3
+MAX_CONSECUTIVE_FAILURES = 5
+FAILED_TRACK_TTL_SECONDS = 3600.0
+EXPIRY_MARGIN_SECONDS = 600.0
+QUICK_FAILURE_SECONDS = 10.0
+RADIO_RETRY_SECONDS = 300.0
+# Fallback reasons starting with this were chosen by the bot, so it may leave radio by itself
+AUTO_RADIO_PREFIX = "Auto:"
 DEAD_STREAM_TTL_SECONDS = 1800.0
 STREAM_CHECK_TIMEOUT_SECONDS = 10.0
-
-YTDL_OPTIONS: Any = {
-    "format": "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "socket_timeout": 15,
-    "source_address": "0.0.0.0",  # noqa: S104
-}
 
 AUDIO_FILE_RE = re.compile(
     r"[\"'\`]([^\"'\`<>\n]+?\.(?:mp3|ogg|m4a)(?:\?[^\"'\`\s<>]*)?)[\"'\`]",
@@ -120,61 +116,6 @@ def compute_next_index(
     return None
 
 
-def _stream_url_from_page(ydl: yt_dlp.YoutubeDL, page: str) -> str:
-    info = ydl.extract_info(page, download=False) or {}
-    entries = info.get("entries")
-    if isinstance(entries, list) and entries:
-        info = entries[0]
-    stream_url = info.get("url") if isinstance(info, dict) else None
-    if not stream_url:
-        raise ValueError("no stream URL in the extracted media")
-    return str(stream_url)
-
-
-def _extract_stream_url_sync(
-    query: str,
-    skip: frozenset[str],
-    on_failed: Callable[[str], None],
-) -> str:
-    """Return a stream URL, trying SoundCloud then YouTube results; report each failed page."""
-    failed: set[str] = set()
-    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-        if query.startswith(("http://", "https://")):
-            return _stream_url_from_page(ydl, query)
-
-        with yt_dlp.YoutubeDL({**YTDL_OPTIONS, "extract_flat": "in_playlist"}) as finder:
-            for prefix, source in (("scsearch", "SoundCloud"), ("ytsearch", "YouTube")):
-                try:
-                    found = finder.extract_info(
-                        f"{prefix}{SEARCH_CANDIDATES}:{query}", download=False
-                    )
-                except Exception as exc:
-                    logger.warning("%s search failed for '%s': %s", source, query, exc)
-                    continue
-                entries = [e for e in (found or {}).get("entries") or [] if isinstance(e, dict)]
-                pages = [str(e["url"]) for e in entries if e.get("url")]
-                if not pages:
-                    logger.warning("%s search found nothing for '%s'.", source, query)
-                    continue
-                for page in pages:
-                    if page in skip or page in failed:
-                        continue
-                    try:
-                        stream_url = _stream_url_from_page(ydl, page)
-                    except Exception as exc:
-                        failed.add(page)
-                        on_failed(page)
-                        logger.warning(
-                            "Skipping %s result %s for '%s': %s", source, page, query, exc
-                        )
-                        continue
-                    logger.info("Resolved '%s' via %s: %s", query, source, page)
-                    return stream_url
-                logger.warning("No playable %s result for '%s'.", source, query)
-
-    raise RuntimeError(f"No playable stream found for '{query}'")
-
-
 ActiveTrack = PlaylistTrack | TrackMetadata
 EndHandler = Callable[[Exception | None], Awaitable[None]]
 
@@ -192,7 +133,17 @@ class AudioManager:
         self.db = db
         self.backup_streams = list(backup_streams)
         self._dead_streams: dict[str, float] = {}
-        self._failed_media: dict[str, float] = {}
+        self.resolver = TrackResolver(db)
+        self._prefetched: dict[int, dict[str, Resolved]] = {}
+        self._failed_tracks: dict[int, dict[str, tuple[str, float]]] = {}
+        self._plan: dict[int, list[int]] = {}
+        self._prefetch_tasks: dict[int, asyncio.Task[None]] = {}
+        self._prefetch_generation: dict[int, int] = {}
+        self._radio_return_tasks: dict[int, asyncio.Task[None]] = {}
+        self._consecutive_failures: dict[int, int] = {}
+        self._skips: dict[int, deque[float]] = {}
+        self._track_started_at: dict[int, float] = {}
+        self._playing_source: dict[int, str] = {}
         self._notice_problems: set[int] = set()
         self._fallback_playing: dict[int, str] = {}
         self._active_tracks: dict[int, ActiveTrack | None] = {}
@@ -358,14 +309,15 @@ class AudioManager:
             if live:
                 return live[secrets.randbelow(len(live))]
             query = LOFI_RADIO_QUERIES[secrets.randbelow(len(LOFI_RADIO_QUERIES))]
+            artist, _, title = query.partition(" - ")
             try:
-                return await self._extract_stream_url(query)
+                return (await self.resolver.resolve(TrackMetadata("", title, artist))).stream_url
             except Exception as exc:
                 logger.warning("Purrple Cat lookup failed (%s); using a backup stream.", exc)
                 return None
 
         try:
-            return await self._extract_stream_url(cleaned)
+            return await self.resolver.extract(cleaned)
         except Exception as exc:
             logger.warning("Fallback URL %s failed (%s); using a backup stream.", cleaned, exc)
             return None
@@ -425,47 +377,6 @@ class AudioManager:
             reason,
             DEAD_STREAM_TTL_SECONDS // 60,
         )
-
-    async def _extract_stream_url(self, query: str) -> str:
-        now = time.monotonic()
-        self._failed_media = {k: v for k, v in self._failed_media.items() if v > now}
-        until = now + FAILED_MEDIA_TTL_SECONDS
-        loop = asyncio.get_running_loop()
-
-        # Runs in the worker thread as each page fails; the write happens on the event loop
-        def remember(page: str) -> None:
-            loop.call_soon_threadsafe(self._failed_media.__setitem__, page, until)
-
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                _extract_stream_url_sync, query, frozenset(self._failed_media), remember
-            ),
-            timeout=RESOLVE_TIMEOUT_SECONDS,
-        )
-
-    async def _resolve_with_retries(
-        self,
-        track: ActiveTrack,
-        max_attempts: int = 2,
-    ) -> str:
-        """Attempt to resolve a track's stream URL via SoundCloud/yt-dlp with retries."""
-        query = f"{track.artist} - {track.title}"
-        last_exc: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return await self._extract_stream_url(query)
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    "Stream resolve attempt %d/%d failed for '%s': %s",
-                    attempt,
-                    max_attempts,
-                    query,
-                    exc,
-                )
-                if attempt < max_attempts:
-                    await asyncio.sleep(backoff_delay(attempt - 1, base=2.0))
-        raise RuntimeError(f"Failed to resolve stream after {max_attempts} attempts: {last_exc}")
 
     async def _set_wanted(self, guild_id: int, wanted: bool) -> None:
         if wanted:
@@ -573,7 +484,7 @@ class AudioManager:
     async def resume_from_state(self, guild: discord.Guild) -> None:
         """Restart whatever the guild was last playing: its fallback stream or its playlist."""
         settings = await self.db.get_guild_settings(guild.id)
-        if settings.on_fallback:
+        if settings.on_fallback and not settings.fallback_reason.startswith(AUTO_RADIO_PREFIX):
             await self.start_fallback(
                 guild,
                 reason=settings.fallback_reason or "24/7 Fallback Radio",
@@ -713,60 +624,228 @@ class AudioManager:
             use_backup=use_backup,
         )
 
-    async def _play_track(
-        self,
-        guild: discord.Guild,
-        track: ActiveTrack,
-        settings: GuildSettings,
-        on_end: EndHandler,
-    ) -> bool:
-        """Resolve and play one track, or fall back to radio; return whether audio started."""
-        with self._starting(guild.id):
-            return await self._resolve_and_play(guild, track, settings, on_end)
+    def _known_failure(self, guild_id: int, track: ActiveTrack) -> str | None:
+        entry = self._failed_tracks.get(guild_id, {}).get(track_key(track))
+        if entry is not None and entry[1] > time.monotonic():
+            return entry[0]
+        return None
 
-    async def _resolve_and_play(
-        self,
-        guild: discord.Guild,
-        track: ActiveTrack,
-        settings: GuildSettings,
-        on_end: EndHandler,
-    ) -> bool:
+    def _record_skip(
+        self, guild: discord.Guild, track: ActiveTrack, reason: str, upcoming: bool = False
+    ) -> None:
+        """Remember a track that can't play for a while and log the one line saying why."""
+        now = time.monotonic()
+        self._failed_tracks.setdefault(guild.id, {})[track_key(track)] = (
+            reason,
+            now + FAILED_TRACK_TTL_SECONDS,
+        )
+        self._skips.setdefault(guild.id, deque()).append(now)
+        self.skips_last_hour(guild.id)
+        logger.warning(
+            "Skipping '%s - %s' in guild %s%s: %s",
+            track.artist,
+            track.title,
+            guild.id,
+            " (found while prefetching)" if upcoming else "",
+            reason,
+        )
+
+    def forget_failures(self, guild_id: int) -> None:
+        """Give every skipped track another chance, e.g. when someone restarts the playlist."""
+        self._failed_tracks.pop(guild_id, None)
+        self._consecutive_failures.pop(guild_id, None)
+
+    def skips_last_hour(self, guild_id: int) -> int:
+        """Return how many tracks were skipped as unplayable in the last hour."""
+        skips = self._skips.get(guild_id)
+        if not skips:
+            return 0
+        cutoff = time.monotonic() - 3600.0
+        while skips and skips[0] < cutoff:
+            skips.popleft()
+        return len(skips)
+
+    def next_up(self, guild_id: int, playlist: Sequence[PlaylistTrack]) -> ActiveTrack | None:
+        """Return the track expected to play next: the queue first, then the planned index."""
+        queue = self._queues.get(guild_id)
+        if queue:
+            return queue[0]
+        for index in self._plan.get(guild_id, []):
+            if index < len(playlist) and self._known_failure(guild_id, playlist[index]) is None:
+                return playlist[index]
+        return None
+
+    def _next_after(
+        self, guild_id: int, index: int, settings: GuildSettings, total: int
+    ) -> int | None:
+        """Return the index that follows `index`, using the prefetch plan when there is one."""
+        plan = [i for i in self._plan.get(guild_id, []) if i < total]
+        if plan and plan[0] == index:
+            plan.pop(0)
+        self._plan[guild_id] = plan
+        if plan:
+            return plan[0]
+        return compute_next_index(index, total, settings.loop_mode, settings.shuffle)
+
+    def _replan(self, guild_id: int, started: int, settings: GuildSettings, total: int) -> None:
+        """Plan the next PREFETCH_COUNT indices, keeping choices already made (e.g. shuffle)."""
+        old = [i for i in self._plan.get(guild_id, []) if i < total]
+        plan = old[1:] if old and old[0] == started else []
+        last = plan[-1] if plan else started
+        # Never plan as far as the track that's playing now; small playlists wrap quickly
+        while len(plan) < min(PREFETCH_COUNT, total - 1):
+            following = compute_next_index(last, total, settings.loop_mode, settings.shuffle)
+            if following is None:
+                break
+            plan.append(following)
+            last = following
+        self._plan[guild_id] = plan
+
+    async def _resolve_track(self, guild_id: int, track: ActiveTrack) -> Resolved:
+        """Use a prefetched stream if it isn't about to expire, else resolve now."""
+        ready = self._prefetched.get(guild_id, {}).pop(track_key(track), None)
+        if ready is not None:
+            if not ready.expiring(time.time(), EXPIRY_MARGIN_SECONDS):
+                return ready
+            try:
+                return await self.resolver.refresh(ready)
+            except Exception as exc:
+                logger.info("Refreshing %s failed (%s); resolving again.", ready.source_id, exc)
+        return await self.resolver.resolve(track)
+
+    def _start_prefetch(self, guild: discord.Guild) -> None:
+        # Superseded runs stop themselves; cancelling one inside an aiosqlite call leaks its thread
+        generation = self._prefetch_generation.get(guild.id, 0) + 1
+        self._prefetch_generation[guild.id] = generation
+        self._prefetch_tasks[guild.id] = self.bot.loop.create_task(
+            self._prefetch(guild, generation)
+        )
+
+    async def _prefetch(self, guild: discord.Guild, generation: int) -> None:
+        """Resolve the planned tracks ahead of time so a bad one is skipped before it's due."""
+        guild_id = guild.id
         try:
-            stream_url = await self._resolve_with_retries(track)
-        except Exception as exc:
-            logger.error("Stream extraction failed in guild %s: %s", guild.id, exc)
-            if should_fallback_on_error(settings.fallback_triggers):
-                await self.start_fallback(
-                    guild,
-                    reason=f"Failed to stream '{track.title}' by {track.artist}.",
-                )
-                return True
-            await self.notify_control_channel(
-                guild,
-                title="⚠️ Track Stream Error",
-                description=(
-                    f"Could not stream **{track.title}** by **{track.artist}** "
-                    "and error-fallback is disabled."
-                ),
-                color=discord.Color.red(),
-            )
-            return False
+            playlist = await self.db.get_playlist(guild_id)
+            planned = [i for i in self._plan.get(guild_id, []) if i < len(playlist)]
+            keep = {track_key(playlist[i]) for i in planned}
+            ready = self._prefetched.setdefault(guild_id, {})
+            for key in [k for k in ready if k not in keep]:
+                del ready[key]
+            for index in planned:
+                if self._prefetch_generation.get(guild_id) != generation:
+                    return
+                track = playlist[index]
+                key = track_key(track)
+                if self._known_failure(guild_id, track) is not None:
+                    continue
+                have = ready.get(key)
+                if have is not None and not have.expiring(time.time(), EXPIRY_MARGIN_SECONDS):
+                    continue
+                try:
+                    ready[key] = await self.resolver.resolve(track)
+                except SourcesUnreachable as exc:
+                    logger.warning("Prefetch paused in guild %s: %s", guild_id, exc)
+                    return
+                except Exception as exc:
+                    self._record_skip(guild, track, str(exc) or type(exc).__name__, upcoming=True)
+        except Exception:
+            logger.exception("Prefetch failed in guild %s.", guild_id)
 
+    async def _start_track(
+        self,
+        guild: discord.Guild,
+        track: ActiveTrack,
+        resolved: Resolved,
+        settings: GuildSettings,
+        on_end: EndHandler,
+        index: int | None,
+        total: int,
+    ) -> bool:
+        """Play a resolved track; return False if playback was stopped meanwhile."""
         async with self._get_lock(guild.id):
             if guild.id not in self._wanted:
                 return False
+            if index is not None:
+                await self.db.set_current_index(guild.id, index)
             await self.db.set_fallback_state(guild.id, on_fallback=False, reason="")
             self._active_tracks[guild.id] = track
-            await self._play_stream(guild, stream_url, settings.volume, on_end)
-        logger.info("Now playing '%s - %s' in guild %s.", track.artist, track.title, guild.id)
+            self._playing_source[guild.id] = resolved.source_id
+            self._track_started_at[guild.id] = time.monotonic()
+            self._consecutive_failures[guild.id] = 0
+            await self._play_stream(guild, resolved.stream_url, settings.volume, on_end)
+        logger.info(
+            "Now playing '%s - %s' in guild %s from %s.",
+            track.artist,
+            track.title,
+            guild.id,
+            resolved.source_id,
+        )
+        if index is not None:
+            self._replan(guild.id, index, settings, total)
+        self._start_prefetch(guild)
         return True
+
+    async def _go_to_radio(self, guild: discord.Guild, why: str) -> None:
+        """Switch to radio on the bot's own call, and keep trying to get back to the playlist."""
+        await self.start_fallback(guild, reason=f"{AUTO_RADIO_PREFIX} {why}")
+        existing = self._radio_return_tasks.get(guild.id)
+        if existing is None or existing.done():
+            self._radio_return_tasks[guild.id] = self.bot.loop.create_task(
+                self._radio_return(guild)
+            )
+
+    async def _radio_return(self, guild: discord.Guild) -> None:
+        """While on automatic radio, periodically try the playlist and leave once a track works."""
+        guild_id = guild.id
+        try:
+            while guild_id in self._wanted:
+                await asyncio.sleep(RADIO_RETRY_SECONDS)
+                settings = await self.db.get_guild_settings(guild_id)
+                if (
+                    guild_id not in self._wanted
+                    or not settings.on_fallback
+                    or not settings.fallback_reason.startswith(AUTO_RADIO_PREFIX)
+                ):
+                    return
+                playlist = await self.db.get_playlist(guild_id)
+                index: int | None = settings.current_index
+                attempts = 0
+                for _ in range(len(playlist)):
+                    if index is None or attempts >= PREFETCH_COUNT:
+                        break
+                    index = compute_next_index(index, len(playlist), "playlist", settings.shuffle)
+                    if index is None:
+                        break
+                    track = playlist[index]
+                    if self._known_failure(guild_id, track) is not None:
+                        continue
+                    attempts += 1
+                    try:
+                        ready = await self.resolver.resolve(track)
+                    except SourcesUnreachable as exc:
+                        logger.info("Still on radio in guild %s: %s", guild_id, exc)
+                        break
+                    except Exception as exc:
+                        self._record_skip(guild, track, str(exc) or type(exc).__name__)
+                        continue
+                    self._prefetched.setdefault(guild_id, {})[track_key(track)] = ready
+                    logger.info("Leaving radio in guild %s: '%s' resolved.", guild_id, track.title)
+                    await self.play_playlist_index(guild, index=index)
+                    await self.notify_control_channel(
+                        guild,
+                        title="🎶 Back to the Playlist",
+                        description=f"Tracks are streaming again, starting with **{track.title}**.",
+                    )
+                    return
+        except Exception:
+            logger.exception("Radio return check failed in guild %s.", guild_id)
 
     async def play_playlist_index(
         self,
         guild: discord.Guild,
         index: int | None = None,
     ) -> None:
-        """Play the track at `index` (or saved cursor) in the server's playlist."""
+        """Play the track at `index` (or the saved cursor), skipping tracks that can't stream."""
         await self._set_wanted(guild.id, True)
         settings = await self.db.get_guild_settings(guild.id)
         playlist = await self.db.get_playlist(guild.id)
@@ -784,16 +863,57 @@ class AudioManager:
                 "Add tracks with `/playlist add` or start fallback with `/fallback start`."
             )
 
-        target_index = settings.current_index if index is None else index
-        if target_index < 0 or target_index >= len(playlist):
-            target_index = 0
+        target: int | None = settings.current_index if index is None else index
+        if target is None or target < 0 or target >= len(playlist):
+            target = 0
+        total = len(playlist)
+        radio_allowed = should_fallback_on_error(settings.fallback_triggers)
 
-        await self.db.set_current_index(guild.id, target_index)
-        await self._play_track(
+        with self._starting(guild.id):
+            for _ in range(total):
+                if guild.id not in self._wanted:
+                    return
+                track = playlist[target]
+                if self._known_failure(guild.id, track) is None:
+                    try:
+                        resolved = await self._resolve_track(guild.id, track)
+                    except SourcesUnreachable as exc:
+                        if radio_allowed:
+                            await self._go_to_radio(guild, f"search sites unreachable ({exc})")
+                            return
+                        raise
+                    except Exception as exc:
+                        self._record_skip(guild, track, str(exc) or type(exc).__name__)
+                    else:
+                        await self._start_track(
+                            guild,
+                            track,
+                            resolved,
+                            settings,
+                            functools.partial(self._handle_track_finished, guild, target),
+                            target,
+                            total,
+                        )
+                        return
+
+                failures = self._consecutive_failures.get(guild.id, 0) + 1
+                self._consecutive_failures[guild.id] = failures
+                if failures >= MAX_CONSECUTIVE_FAILURES and radio_allowed:
+                    await self._go_to_radio(guild, f"{failures} tracks in a row failed to stream")
+                    return
+                following = self._next_after(guild.id, target, settings, total)
+                if following is None:
+                    break
+                target = following
+
+        if radio_allowed:
+            await self._go_to_radio(guild, "no track in the playlist could be streamed")
+            return
+        await self.notify_control_channel(
             guild,
-            playlist[target_index],
-            settings,
-            lambda error: self._handle_track_finished(guild, target_index, error),
+            title="⚠️ Nothing Playable",
+            description="No track in the playlist could be streamed. Retrying shortly.",
+            color=discord.Color.red(),
         )
 
     async def _play_next_queued(self, guild: discord.Guild) -> bool:
@@ -804,22 +924,29 @@ class AudioManager:
             self._queue_interrupted[guild.id] = True
         elif previous is None:
             self._queue_interrupted[guild.id] = False
-        while queue:
-            track = queue.popleft()
-            await self._set_wanted(guild.id, True)
-            settings = await self.db.get_guild_settings(guild.id)
-            # Advance past the cursor only if the queue cut in after a playlist track
-            finished: int | None = (
-                settings.current_index if self._queue_interrupted.get(guild.id) else None
-            )
-            started = await self._play_track(
-                guild,
-                track,
-                settings,
-                functools.partial(self._handle_track_finished, guild, finished),
-            )
-            if started:
-                return True
+        with self._starting(guild.id):
+            while queue:
+                track = queue.popleft()
+                await self._set_wanted(guild.id, True)
+                settings = await self.db.get_guild_settings(guild.id)
+                try:
+                    resolved = await self._resolve_track(guild.id, track)
+                except Exception as exc:
+                    self._record_skip(guild, track, str(exc) or type(exc).__name__)
+                    continue
+                # Advance past the cursor only if the queue cut in after a playlist track
+                finished: int | None = (
+                    settings.current_index if self._queue_interrupted.get(guild.id) else None
+                )
+                return await self._start_track(
+                    guild,
+                    track,
+                    resolved,
+                    settings,
+                    functools.partial(self._handle_track_finished, guild, finished),
+                    None,
+                    0,
+                )
         return False
 
     async def _handle_track_finished(
@@ -828,7 +955,7 @@ class AudioManager:
         finished_index: int | None,
         error: Exception | None,
     ) -> None:
-        """Advance to the next track, or resume the saved cursor if `finished_index` is None."""
+        """Move on to the next track, or resume the saved cursor if `finished_index` is None."""
         settings = await self.db.get_guild_settings(guild.id)
         if settings.on_fallback or guild.id not in self._wanted:
             return
@@ -837,14 +964,17 @@ class AudioManager:
             self.schedule_recovery(guild, "voice connection lost during playback")
             return
 
-        if error is not None and should_fallback_on_error(settings.fallback_triggers):
-            await self.start_fallback(
-                guild,
-                reason=f"Playback interrupted by stream error: {error}",
-            )
-            return
+        if error is not None:
+            track = self._active_tracks.get(guild.id)
+            played = time.monotonic() - self._track_started_at.get(guild.id, 0.0)
+            if track is not None and played < QUICK_FAILURE_SECONDS:
+                reason = f"stream died after {played:.0f}s: {error}"
+                self._record_skip(guild, track, reason)
+                source_id = self._playing_source.get(guild.id)
+                if source_id:
+                    await self.resolver.forget(track, source_id, reason)
 
-        if await self._play_next_queued(guild):
+        if await self._play_next_queued(guild) or guild.id not in self._wanted:
             return
 
         if finished_index is None:
@@ -852,12 +982,7 @@ class AudioManager:
             return
 
         playlist = await self.db.get_playlist(guild.id)
-        next_idx = compute_next_index(
-            current_index=finished_index,
-            total_tracks=len(playlist),
-            loop_mode=settings.loop_mode,
-            shuffle=settings.shuffle,
-        )
+        next_idx = self._next_after(guild.id, finished_index, settings, len(playlist))
 
         if next_idx is None:
             self._active_tracks[guild.id] = None
@@ -892,6 +1017,7 @@ class AudioManager:
         start_from: str = "saved_position",
     ) -> None:
         """Exit fallback radio mode and resume the server's custom Spotify playlist."""
+        self.forget_failures(guild.id)
         settings = await self.db.get_guild_settings(guild.id)
         target_index = 0 if start_from == "beginning" else settings.current_index
         await self.play_playlist_index(guild, index=target_index)
@@ -904,12 +1030,7 @@ class AudioManager:
         playlist = await self.db.get_playlist(guild.id)
         if not playlist:
             raise ValueError("Cannot skip because the server playlist is empty.")
-        next_idx = compute_next_index(
-            current_index=settings.current_index,
-            total_tracks=len(playlist),
-            loop_mode="playlist" if settings.loop_mode == "off" else settings.loop_mode,
-            shuffle=settings.shuffle,
-        )
+        next_idx = self._next_after(guild.id, settings.current_index, settings, len(playlist))
         await self.play_playlist_index(guild, index=next_idx or 0)
 
     async def set_volume(self, guild: discord.Guild, level_percent: int) -> float:
@@ -927,9 +1048,10 @@ class AudioManager:
         """Stop playback, cancel any recovery, and disconnect from the voice channel."""
         await self._set_wanted(guild.id, False)
         self._queues.pop(guild.id, None)
-        recovery = self._recovery_tasks.pop(guild.id, None)
-        if recovery is not None:
-            recovery.cancel()
+        # Background tasks see the guild is no longer wanted and stop on their own
+        self._prefetch_generation[guild.id] = self._prefetch_generation.get(guild.id, 0) + 1
+        self._plan.pop(guild.id, None)
+        self._prefetched.pop(guild.id, None)
         async with self._get_lock(guild.id):
             self._generation[guild.id] = self._generation.get(guild.id, 0) + 1
             self._active_tracks[guild.id] = None

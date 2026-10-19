@@ -1,4 +1,4 @@
-"""Tests for picking playable search results, health-checking fallback stations and notices."""
+"""Tests for health-checking fallback stations and mod channel notices."""
 
 from __future__ import annotations
 
@@ -8,82 +8,10 @@ from typing import Any
 
 import discord
 import pytest
-import yt_dlp
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from src import audio_manager
 from src.audio_manager import AudioManager, extract_audio_urls_from_text
 from src.config import parse_url_list
-
-DEAD = "https://www.youtube.com/watch?v=dead"
-GOOD = "https://www.youtube.com/watch?v=good"
-
-
-class FakeYDL:
-    """Stands in for yt_dlp.YoutubeDL: flat searches list pages, pages resolve or fail."""
-
-    calls: list[str] = []
-    soundcloud: list[str] = []
-    youtube: list[str] = [DEAD, GOOD]
-
-    def __init__(self, options: dict[str, Any]) -> None:
-        self.flat = bool(options.get("extract_flat"))
-
-    def __enter__(self) -> FakeYDL:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        return None
-
-    def extract_info(self, target: str, download: bool = False) -> dict[str, Any]:
-        FakeYDL.calls.append(target)
-        if target.startswith("scsearch"):
-            return {"entries": [{"url": u} for u in FakeYDL.soundcloud]}
-        if target.startswith("ytsearch"):
-            return {"entries": [{"url": u} for u in FakeYDL.youtube]}
-        if target == DEAD:
-            raise yt_dlp.utils.DownloadError("ERROR: [youtube] dead: This video is not available")
-        return {"url": f"https://cdn.example/{target.rsplit('=', 1)[-1]}"}
-
-
-@pytest.fixture
-def fake_ydl(monkeypatch: pytest.MonkeyPatch) -> type[FakeYDL]:
-    FakeYDL.calls = []
-    FakeYDL.soundcloud = []
-    FakeYDL.youtube = [DEAD, GOOD]
-    monkeypatch.setattr(audio_manager.yt_dlp, "YoutubeDL", FakeYDL)
-    return FakeYDL
-
-
-def test_search_skips_unavailable_video_and_logs_why_soundcloud_missed(
-    fake_ydl: type[FakeYDL], caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.WARNING)
-    failed: list[str] = []
-    url = audio_manager._extract_stream_url_sync("Cat - Song", frozenset(), failed.append)
-    assert url == "https://cdn.example/good"
-    assert failed == [DEAD]
-    assert "SoundCloud search found nothing for 'Cat - Song'" in caplog.text
-    assert "This video is not available" in caplog.text
-
-
-def test_search_raises_with_every_failed_page(fake_ydl: type[FakeYDL]) -> None:
-    fake_ydl.youtube = [DEAD]
-    failed: list[str] = []
-    with pytest.raises(RuntimeError, match="No playable stream"):
-        audio_manager._extract_stream_url_sync("Cat - Song", frozenset(), failed.append)
-    assert failed == [DEAD]
-
-
-async def test_retry_never_requests_a_page_that_already_failed(fake_ydl: type[FakeYDL]) -> None:
-    manager = AudioManager(bot=SimpleNamespace(), db=None)  # type: ignore[arg-type]
-    fake_ydl.youtube = [DEAD]
-    with pytest.raises(RuntimeError):
-        await manager._extract_stream_url("Cat - Song")
-    fake_ydl.calls.clear()
-    fake_ydl.youtube = [DEAD, GOOD]
-    assert await manager._extract_stream_url("Cat - Song") == "https://cdn.example/good"
-    assert DEAD not in fake_ydl.calls
 
 
 @pytest.fixture
