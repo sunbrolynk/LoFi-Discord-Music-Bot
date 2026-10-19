@@ -1,5 +1,5 @@
 # Pin to Python 3.12 Bookworm Slim (matches Python 3.12 hash-pinned wheels in requirements.txt)
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
