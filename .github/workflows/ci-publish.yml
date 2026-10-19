@@ -39,6 +39,9 @@ jobs:
           pip install --require-hashes -r requirements.txt
           pip install --require-hashes -r requirements-dev.txt
 
+      - name: Audit every lock with pip-audit
+        run: bash scripts/audit-deps.sh
+
       - name: Run Secret Scanner on all tracked files
         run: |
           git ls-files -z | xargs -0 python scripts/check_secrets.py

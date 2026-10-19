@@ -9,7 +9,7 @@ Set up the virtual environment and hooks as in the README's local development
 steps, then let the hooks run on every commit and push:
 
 - **pre-commit:** the secret scans, Ruff lint and format, and Mypy.
-- **pre-push:** the same, plus the full Pytest suite.
+- **pre-push:** the same, plus the full Pytest suite and a pip-audit of both locks.
 
 Every one has to pass; don't push with `--no-verify`. CI runs the same checks
 again on the pull request.
