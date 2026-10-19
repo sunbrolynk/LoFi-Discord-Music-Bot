@@ -17,7 +17,9 @@
 * **Multi-Server Isolation (`guild_id` SQLite Persistence)**: Every Discord server gets its own designated voice channel, mod control text channel, custom playlist, volume, loop/shuffle settings, and fallback configuration stored in `/app/data/lofi_bot.db`.
 * **Mod-Channel Command Lockdown**: Once a server's channels are bound via `/setup`, bot commands are strictly restricted to that server's mod control text channel.
 * **Spotify Track, Album & Playlist Resolution**: Add individual songs, full albums, or entire playlists at any time using `/playlist add <spotify_url>`.
-* **Configurable 24/7 Fallback Stream**: Automatically switches to a 24/7 LoFi radio stream if a track fails to resolve (`on_error`), when a playlist finishes (`on_empty`), both (`on_empty_and_error`), or only when manually triggered (`manual_only`). Jump right back into your custom playlist anytime with `/playlist resume`.
+* **Skips, Not Radio**: A track that can't be streamed is skipped and the next one plays. The bot resolves the next 2-3 tracks in the background while the current one plays, so a bad track is found and skipped before it's due, with no gap. Each skip is logged with its reason.
+* **Configurable 24/7 Fallback Stream**: Switches to a 24/7 LoFi radio stream after 5 tracks in a row fail, or when SoundCloud and YouTube are both unreachable (`on_error`). It also switches when a playlist finishes (`on_empty`), on either (`on_empty_and_error`), or only by hand (`manual_only`). When the bot went to radio by itself, it checks the playlist every 5 minutes and goes back as soon as a track streams. `/playlist resume` and `/play` go back right away and give skipped tracks another chance.
+* **Smart Matching and a Resolve Cache**: Searches SoundCloud and YouTube by artist and title. Each result is scored on how close its length is to the Spotify track and how well its title matches. Results that are over 20% off in length, or are a live, reaction, slowed, sped-up, remix or cover version the original isn't, get rejected. The source that worked is saved in the database, so a track resolves once and is never searched again. A source that fails is kept out for 24 hours.
 * **Self-Healing 24/7 Playback**: If the voice connection drops, a stream dies, or a track can't be found, the bot reconnects and retries with backoff (5s up to 5 minutes) instead of going quiet. A watchdog restarts any server that should be playing but has been silent for 90 seconds, and after a container restart the bot rejoins and resumes every server that was playing. `/stop` is the only thing that keeps it off.
 * **Logs and Healthcheck**: Logs go to stdout (Portainer's log view) and to rotating files in `/app/data/logs/bot.log` (5 MB x 6 files) on the data volume, so they survive restarts. The container reports `unhealthy` when the bot loses Discord or a server has been silent for 10 minutes.
 * **Defense-in-Depth Security & Push Gates**: Every dependency in `requirements.txt` and `requirements-dev.txt` is locked with SHA-256 hashes (`--require-hashes`), and local Git hooks (`pre-commit` and `pre-push`) block leaked secrets, enforce Ruff linting/formatting and Mypy type checks, and run the Pytest unit test suite before any code leaves your machine.
@@ -43,7 +45,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 | `/stop` | None | Stops playback and disconnects the bot from this server's voice channel. |
 | `/mode` | `loop` (`playlist`, `track`, `off`), `shuffle` (`true`/`false`) | Updates loop and shuffle behavior for this server's playlist. |
 | `/volume` | `level` (`1`–`100`) | Sets and saves the playback volume percentage for this server. |
-| `/status` | None | Posts a diagnostic embed showing active mode (Playlist vs. Fallback), current track, fallback reason, bound channels, and saved track count. |
+| `/status` | None | Posts a diagnostic embed: active mode (playlist or fallback radio, with the reason), the current track, the next track up, unplayable tracks skipped in the last hour, bound channels, and saved track count. |
 
 ## First-Time Server Onboarding
 
@@ -156,7 +158,7 @@ If you ever need to rebuild the credentials, local WSL workspace, or deployment 
     # 3. Create the virtual environment and install hash-pinned dependencies
     python3 -m venv .venv
     source .venv/bin/activate
-    pip install "pip==24.3.1" "click==8.1.8" "pip-tools==7.4.1"
+    pip install "pip==26.2.1" "click==8.1.8" "pip-tools==7.6.2"
     pip install --require-hashes -r requirements.txt
     pip install --require-hashes -r requirements-dev.txt
 

@@ -325,6 +325,7 @@ class MusicCommandsCog(commands.Cog):
             return
 
         await interaction.response.defer()
+        self.audio.forget_failures(interaction.guild.id)
         try:
             await self.audio.play_playlist_index(interaction.guild)
             settings = await self.db.get_guild_settings(interaction.guild.id)
@@ -495,6 +496,9 @@ class MusicCommandsCog(commands.Cog):
         else:
             now_playing = "Stopped / Idle"
         queued = self.audio.queue_length(interaction.guild.id)
+        upcoming = self.audio.next_up(interaction.guild.id, playlist)
+        up_next = f"**{upcoming.title}** — {upcoming.artist}" if upcoming else "Nothing planned"
+        skips = self.audio.skips_last_hour(interaction.guild.id)
         voice_mention = (
             f"<#{settings.voice_channel_id}>" if settings.voice_channel_id else "Not set"
         )
@@ -508,6 +512,8 @@ class MusicCommandsCog(commands.Cog):
         )
         embed.add_field(name="Active Mode", value=mode_label, inline=False)
         embed.add_field(name="Now Playing", value=now_playing, inline=False)
+        embed.add_field(name="Up Next", value=up_next, inline=False)
+        embed.add_field(name="Skipped (last hour)", value=f"{skips} unplayable", inline=True)
         embed.add_field(name="Voice Channel", value=voice_mention, inline=True)
         embed.add_field(name="Mod Channel", value=control_mention, inline=True)
         embed.add_field(
