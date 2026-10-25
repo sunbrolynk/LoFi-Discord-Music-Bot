@@ -42,6 +42,7 @@ QUICK_FAILURE_SECONDS = 10.0
 RADIO_RETRY_SECONDS = 300.0
 # Fallback reasons starting with this were chosen by the bot, so it may leave radio by itself
 AUTO_RADIO_PREFIX = "Auto:"
+RADIO_MODE_REASON = "Radio mode"
 DEAD_STREAM_TTL_SECONDS = 1800.0
 STREAM_CHECK_TIMEOUT_SECONDS = 10.0
 
@@ -512,6 +513,19 @@ class AudioManager:
             logger.info("Resuming playback in guild %s after restart.", guild.id)
             self._wanted.add(guild.id)
             self._spawn(guild, self.resume_from_state(guild))
+
+    async def start_radio(self, channel: discord.VoiceChannel, stream_url: str) -> None:
+        """Bind radio mode's channel and stream, then play it as a fallback that never ends."""
+        guild = channel.guild
+        settings = await self.db.get_guild_settings(guild.id)
+        await self.db.set_channels(guild.id, channel.id, settings.control_channel_id)
+        await self.db.update_fallback_config(
+            guild.id, triggers="manual_only", fallback_url=stream_url
+        )
+        logger.info("Radio mode: playing %s in voice channel %s.", stream_url, channel.id)
+        # Wanted before the first try, so a stream that's down at startup is retried with backoff
+        self._wanted.add(guild.id)
+        self._spawn(guild, self.start_fallback(guild, reason=RADIO_MODE_REASON, announce=False))
 
     def watchdog_tick(self, now: float) -> bool:
         """Recover guilds that should be playing but have gone quiet; False if one is stuck."""

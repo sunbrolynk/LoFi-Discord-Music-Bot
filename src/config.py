@@ -25,6 +25,14 @@ class BotConfig:
     database_path: Path
     log_level: str
     backup_fallback_stream_urls: tuple[str, ...] = DEFAULT_BACKUP_STREAM_URLS
+    radio_stream_url: str = ""
+    radio_channel_id: int | None = None
+    radio_nowplaying_url: str = ""
+
+    @property
+    def radio_mode(self) -> bool:
+        """True when the bot only plays RADIO_STREAM_URL in RADIO_CHANNEL_ID."""
+        return bool(self.radio_stream_url)
 
     @property
     def log_dir(self) -> Path:
@@ -65,6 +73,15 @@ def load_config() -> BotConfig:
     if not client_secret:
         missing.append("SPOTIFY_CLIENT_SECRET")
 
+    radio_url = os.getenv("RADIO_STREAM_URL", "").strip()
+    radio_channel = os.getenv("RADIO_CHANNEL_ID", "").strip()
+    nowplaying_url = os.getenv("RADIO_NOWPLAYING_URL", "").strip()
+    if radio_url and not radio_channel.isdigit():
+        raise ValueError("RADIO_CHANNEL_ID must be the voice channel's numeric ID in radio mode.")
+    for name, url in (("RADIO_STREAM_URL", radio_url), ("RADIO_NOWPLAYING_URL", nowplaying_url)):
+        if url and not url.startswith(("http://", "https://")):
+            raise ValueError(f"{name} must be an http(s) URL.")
+
     if missing:
         joined = ", ".join(missing)
         raise ValueError(f"Missing required environment variable(s): {joined}")
@@ -78,6 +95,9 @@ def load_config() -> BotConfig:
         log_level=log_level,
         backup_fallback_stream_urls=parse_url_list(os.getenv("BACKUP_FALLBACK_STREAM_URLS", ""))
         or DEFAULT_BACKUP_STREAM_URLS,
+        radio_stream_url=radio_url,
+        radio_channel_id=int(radio_channel) if radio_url else None,
+        radio_nowplaying_url=nowplaying_url if radio_url else "",
     )
 
 

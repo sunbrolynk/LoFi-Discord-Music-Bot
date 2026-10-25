@@ -22,6 +22,7 @@
 * **Smart Matching and a Resolve Cache**: Searches SoundCloud and YouTube by artist and title. Each result is scored on how close its length is to the Spotify track and how well its title matches. Results that are over 20% off in length, or are a live, reaction, slowed, sped-up, remix or cover version the original isn't, get rejected. The source that worked is saved in the database, so a track resolves once and is never searched again. A source that fails is kept out for 24 hours.
 * **Self-Healing 24/7 Playback**: If the voice connection drops, a stream dies, or a track can't be found, the bot reconnects and retries with backoff (5s up to 5 minutes) instead of going quiet. A watchdog restarts any server that should be playing but has been silent for 90 seconds, and after a container restart the bot rejoins and resumes every server that was playing. `/stop` is the only thing that keeps it off.
 * **Logs and Healthcheck**: Logs go to stdout (Portainer's log view) and to rotating files in `/app/data/logs/bot.log` (5 MB x 6 files) on the data volume, so they survive restarts. The container reports `unhealthy` when the bot loses Discord or a server has been silent for 10 minutes.
+* **Radio-Only Mode**: Set `RADIO_STREAM_URL` and `RADIO_CHANNEL_ID` and the bot plays nothing but that stream in that voice channel, joining it on startup and reconnecting with backoff when the stream or voice connection drops. With `RADIO_NOWPLAYING_URL` set to an AzuraCast now-playing URL, its status shows "Listening to *title – artist*". See [Radio-only mode](#radio-only-mode).
 * **Defense-in-Depth Security & Push Gates**: Every dependency in `requirements.txt` and `requirements-dev.txt` is locked with SHA-256 hashes (`--require-hashes`), and local Git hooks (`pre-commit` and `pre-push`) block leaked secrets with a pinned gitleaks scan and the bot's own token scanner, refuse a push with uncommitted changes, audit both locks with pip-audit, enforce Ruff linting/formatting and Mypy type checks, and run the Pytest unit test suite before any code leaves your machine.
 
 ## Slash Command Reference
@@ -68,6 +69,22 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 
         /playlist resume start_from:saved_position
 
+## Radio-Only Mode
+
+For a bot that only relays one 24/7 station, set these in its environment:
+
+| Variable | Example | Meaning |
+| :--- | :--- | :--- |
+| `RADIO_STREAM_URL` | `https://stream.audiobookmanager.com/listen/lofi/radio.mp3` | The stream to play. Setting it turns radio mode on. |
+| `RADIO_CHANNEL_ID` | `123456789012345678` | The voice channel's ID (Developer Mode on, right-click the channel, **Copy Channel ID**). Required with `RADIO_STREAM_URL`. |
+| `RADIO_NOWPLAYING_URL` | `https://stream.audiobookmanager.com/api/nowplaying/lofi` | Optional. AzuraCast now-playing JSON, polled every 30 seconds for the bot's "Listening to" status. |
+
+On startup the bot binds that channel, joins it and plays the stream. If the stream ends or fails it tries the same stream again with backoff (it never switches to the backup stations), and the usual voice reconnect and watchdog apply. `/playlist`, `/fallback`, `/search`, `/skip` and `/mode` reply that they're off; `/play` restarts the stream after a `/stop`, and `/pause`, `/volume` and `/status` work as usual. Run `/setup` once if you want a mod control channel for those. With `RADIO_STREAM_URL` unset nothing changes.
+
+### Running several copies
+
+Each copy needs its own `DISCORD_BOT_TOKEN` and its own `DATABASE_PATH` folder: the settings database, logs and healthcheck heartbeat all live there. In Docker, give each copy its own stack (or service) with its own data volume; locally, point each one at a different folder, e.g. `DATABASE_PATH=data/radio-lofi/lofi_bot.db`.
+
 ## Deploying with Portainer Stacks
 
 1. Once GitHub Actions finishes building your push to `main`, open your GitHub profile -> **Packages** -> `lofi-discord-music-bot` -> **Package settings**, and set package visibility to **Public** so Portainer can pull `ghcr.io/sunbrolynk/lofi-discord-music-bot:latest` without authentication.
@@ -87,6 +104,9 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
               - BACKUP_FALLBACK_STREAM_URLS=${BACKUP_FALLBACK_STREAM_URLS:-https://stream.laut.fm/lofi}
               - DATABASE_PATH=/app/data/lofi_bot.db
               - LOG_LEVEL=${LOG_LEVEL:-INFO}
+              - RADIO_STREAM_URL=${RADIO_STREAM_URL:-}
+              - RADIO_CHANNEL_ID=${RADIO_CHANNEL_ID:-}
+              - RADIO_NOWPLAYING_URL=${RADIO_NOWPLAYING_URL:-}
             volumes:
               - lofi_bot_data:/app/data
 
@@ -99,6 +119,7 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
    * `SPOTIFY_CLIENT_SECRET` = your Spotify Client Secret
    * `DEFAULT_FALLBACK_STREAM_URL` = `https://lofi.radio` *(optional override; new servers start with it, `/fallback config` changes one server)*
    * `BACKUP_FALLBACK_STREAM_URLS` = `https://stream.laut.fm/lofi` *(optional; comma-separated stations tried in order when a server's own fallback is down)*
+   * `RADIO_STREAM_URL`, `RADIO_CHANNEL_ID`, `RADIO_NOWPLAYING_URL` *(optional; see [Radio-only mode](#radio-only-mode))*
 
    Before playing a fallback station the bot checks it. A station that answers 404 or doesn't answer is skipped for 30 minutes and logged once. If every backup is down, they all get checked again rather than going silent.
 4. Click **Deploy the stack**.

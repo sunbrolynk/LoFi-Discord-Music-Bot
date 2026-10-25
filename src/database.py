@@ -184,7 +184,7 @@ class DatabaseManager:
         self,
         guild_id: int,
         voice_channel_id: int,
-        control_channel_id: int,
+        control_channel_id: int | None,
     ) -> GuildSettings:
         """Bind the designated voice channel and mod control channel for a guild."""
         await self.get_guild_settings(guild_id)
