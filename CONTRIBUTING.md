@@ -2,15 +2,17 @@
 
 ## Changes
 
-Work on a branch and open a pull request into `main`. Explain the problem, the
-change and how you verified it.
+Work on a branch off `dev` and open a pull request into `dev`; `dev` reaches
+`main` in a release pull request. Explain the problem, the change and how you
+verified it.
 
 Set up the virtual environment and hooks as in the README's local development
 steps, then let the hooks run on every commit and push:
 
 - **pre-commit:** the secret scans, Ruff lint and format, and Mypy.
 - **pre-push:** the same, plus the full Pytest suite, a pip-audit of both locks
-  and the changelog check.
+  and the changelog check. The audit fails only on advisories the branch adds;
+  ones already on `dev` are listed and get fixed on their own branch.
 
 Every one has to pass; don't push with `--no-verify`. CI runs the same checks
 again on the pull request.

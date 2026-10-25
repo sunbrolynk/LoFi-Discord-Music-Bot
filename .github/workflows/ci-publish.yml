@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "dev"]
 
 permissions:
   contents: read
@@ -44,6 +44,9 @@ jobs:
           pip install --require-hashes -r requirements-dev.txt
 
       - name: Audit every lock with pip-audit
+        env:
+          # A pull request compares against its base branch, a push against the commit before it.
+          LOFI_AUDIT_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
         run: bash scripts/audit-deps.sh
 
       - name: Run Secret Scanner on all tracked files
