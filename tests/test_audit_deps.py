@@ -8,7 +8,8 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "audit-deps.sh"
 
-# Stands in for pip-audit: a lock line "name==version # vuln ID" reports that advisory, "crash" fails.
+# Stands in for pip-audit: "name==version # vuln ID" reports that advisory, "# skip" marks the
+# package unauditable, and a "crash" line fails.
 FAKE_PIP_AUDIT = """\
 #!/usr/bin/env python3
 import json, sys
@@ -18,12 +19,15 @@ deps = []
 for line in open(lock):
     if line.strip() == "crash":
         sys.exit(2)
+    if line.rstrip().endswith("# skip"):
+        deps.append({"name": line.partition("==")[0], "skip_reason": "not on PyPI"})
+        continue
     spec, _, vuln = line.partition("# vuln ")
     name, _, version = spec.strip().partition("==")
     if name:
         deps.append({"name": name, "version": version, "vulns": [{"id": vuln.strip()}] if vuln else []})
 json.dump({"dependencies": deps}, open(out, "w"))
-sys.exit(1 if any(d["vulns"] for d in deps) else 0)
+sys.exit(1 if any(d.get("vulns") or "skip_reason" in d for d in deps) else 0)
 """
 
 
@@ -96,3 +100,17 @@ def test_advisory_in_a_lock_missing_from_base_blocks(repo: Path) -> None:
 def test_pip_audit_crash_fails(repo: Path) -> None:
     write_locks(repo, "crash\n")
     assert audit(repo).returncode != 0
+
+
+def test_newly_unauditable_package_blocks(repo: Path) -> None:
+    write_locks(repo, "old==1.0 # vuln OLD-1\nlocal==1.0 # skip\n")
+    result = audit(repo)
+    assert result.returncode == 1
+    assert "local skipped" in result.stderr
+
+
+def test_package_already_unauditable_on_base_does_not_block(repo: Path) -> None:
+    write_locks(repo, "old==1.0 # vuln OLD-1\nlocal==1.0 # skip\n")
+    git(repo, "commit", "-q", "-am", "add local")
+    git(repo, "tag", "-f", "base")
+    assert audit(repo).returncode == 0
