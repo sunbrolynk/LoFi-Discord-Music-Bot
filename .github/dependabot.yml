@@ -14,6 +14,11 @@ updates:
       interval: weekly
     cooldown:
       default-days: 14
+    # The locks are compiled on the image's Python, so a Python version move is its own branch.
+    # Dependabot calls 3.12 -> 3.14 a minor bump, so both minor and major are ignored.
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
