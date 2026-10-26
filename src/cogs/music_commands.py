@@ -14,6 +14,13 @@ from src.database import DatabaseManager, PlaylistTrack
 from src.spotify_client import SpotifyResolver
 
 TRACKS_PER_PAGE = 10
+# Commands that pick what plays or where; radio mode only ever plays its one stream in its one channel
+RADIO_BLOCKED_COMMANDS = frozenset({"playlist", "fallback", "search", "skip", "mode", "setup"})
+
+
+def blocked_in_radio_mode(command_name: str) -> bool:
+    """Return True if a command (by qualified name) is turned off in radio mode."""
+    return command_name.split(" ", 1)[0] in RADIO_BLOCKED_COMMANDS
 
 
 def is_allowed_in_channel(
@@ -44,17 +51,43 @@ class MusicCommandsCog(commands.Cog):
         db: DatabaseManager,
         spotify: SpotifyResolver,
         audio: AudioManager,
+        radio_mode: bool = False,
+        radio_channel_id: int | None = None,
+        radio_stream_url: str = "",
     ) -> None:
         self.bot = bot
         self.db = db
         self.spotify = spotify
         self.audio = audio
+        self.radio_mode = radio_mode
+        self.radio_channel_id = radio_channel_id
+        self.radio_stream_url = radio_stream_url
+
+    async def _play_radio(self, guild: discord.Guild) -> str:
+        """Restart radio mode's configured stream in its configured channel, never a server's own settings."""
+        channel = self.bot.get_channel(self.radio_channel_id or 0)
+        if not isinstance(channel, discord.VoiceChannel) or channel.guild.id != guild.id:
+            return "📻 This bot's radio only plays in its own channel."
+        await self.audio.start_radio(channel, self.radio_stream_url)
+        return "📻 Playing the radio stream."
 
     async def _require_mod_channel(self, interaction: discord.Interaction) -> bool:
         """Verify the interaction occurred inside the guild's configured mod control channel."""
         if interaction.guild is None or interaction.channel_id is None:
             await interaction.response.send_message(
                 "Commands can only be used inside a Discord server.",
+                ephemeral=True,
+            )
+            return False
+
+        command = interaction.command
+        if (
+            self.radio_mode
+            and command is not None
+            and blocked_in_radio_mode(command.qualified_name)
+        ):
+            await interaction.response.send_message(
+                "📻 This bot only plays its radio stream, so playlist commands are off.",
                 ephemeral=True,
             )
             return False
@@ -325,6 +358,12 @@ class MusicCommandsCog(commands.Cog):
             return
 
         await interaction.response.defer()
+        if self.radio_mode:
+            try:
+                await interaction.followup.send(await self._play_radio(interaction.guild))
+            except Exception as exc:
+                await interaction.followup.send(f"⚠️ Playback failed: {exc}")
+            return
         self.audio.forget_failures(interaction.guild.id)
         try:
             await self.audio.play_playlist_index(interaction.guild)
