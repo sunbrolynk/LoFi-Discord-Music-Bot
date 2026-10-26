@@ -19,6 +19,7 @@ import discord
 
 from src.config import DEFAULT_BACKUP_STREAM_URLS
 from src.database import DatabaseManager, GuildSettings, PlaylistTrack, TrackMetadata
+from src.radio import check_public_url
 from src.resolver import Resolved, SourcesUnreachable, TrackResolver, track_key
 
 logger = logging.getLogger(__name__)
@@ -245,9 +246,10 @@ class AudioManager:
     async def ensure_voice_client(self, guild: discord.Guild) -> discord.VoiceClient:
         """Connect to or move to the server's configured voice channel."""
         settings = await self.db.get_guild_settings(guild.id)
-        if not settings.voice_channel_id:
+        channel_id = settings.radio_channel_id or settings.voice_channel_id
+        if not channel_id:
             raise ValueError("No voice channel configured for this server. Run `/setup` first.")
-        channel = guild.get_channel(settings.voice_channel_id)
+        channel = guild.get_channel(channel_id)
         if not isinstance(channel, discord.VoiceChannel):
             raise ValueError(
                 "Configured voice channel was not found. Re-run `/setup` to update it."
@@ -483,9 +485,11 @@ class AudioManager:
                 del self._recovery_tasks[guild_id]
 
     async def resume_from_state(self, guild: discord.Guild) -> None:
-        """Restart whatever the guild was last playing: its fallback stream or its playlist."""
+        """Restart whatever the guild was last playing: its radio, fallback stream or playlist."""
         settings = await self.db.get_guild_settings(guild.id)
-        if settings.on_fallback and not settings.fallback_reason.startswith(AUTO_RADIO_PREFIX):
+        if settings.radio_stream_url:
+            await self.start_fallback(guild, reason=RADIO_MODE_REASON, announce=False)
+        elif settings.on_fallback and not settings.fallback_reason.startswith(AUTO_RADIO_PREFIX):
             await self.start_fallback(
                 guild,
                 reason=settings.fallback_reason or "24/7 Fallback Radio",
@@ -502,7 +506,7 @@ class AudioManager:
                 if settings.on_fallback:
                     await self.db.set_fallback_state(guild.id, on_fallback=False)
                 continue
-            channel = guild.get_channel(settings.voice_channel_id or 0)
+            channel = guild.get_channel(settings.radio_channel_id or settings.voice_channel_id or 0)
             if not isinstance(channel, discord.VoiceChannel):
                 logger.warning(
                     "Voice channel for guild %s no longer exists; not resuming playback.",
@@ -513,19 +517,6 @@ class AudioManager:
             logger.info("Resuming playback in guild %s after restart.", guild.id)
             self._wanted.add(guild.id)
             self._spawn(guild, self.resume_from_state(guild))
-
-    async def start_radio(self, channel: discord.VoiceChannel, stream_url: str) -> None:
-        """Bind radio mode's channel and stream, then play it as a fallback that never ends."""
-        guild = channel.guild
-        settings = await self.db.get_guild_settings(guild.id)
-        await self.db.set_channels(guild.id, channel.id, settings.control_channel_id)
-        await self.db.update_fallback_config(
-            guild.id, triggers="manual_only", fallback_url=stream_url
-        )
-        logger.info("Radio mode: playing %s in voice channel %s.", stream_url, channel.id)
-        # Wanted before the first try, so a stream that's down at startup is retried with backoff
-        self._wanted.add(guild.id)
-        self._spawn(guild, self.start_fallback(guild, reason=RADIO_MODE_REASON, announce=False))
 
     def watchdog_tick(self, now: float) -> bool:
         """Recover guilds that should be playing but have gone quiet; False if one is stuck."""
@@ -569,10 +560,12 @@ class AudioManager:
             on_fallback=True,
             reason=reason,
         )
-        stream_url = await self._resolve_fallback_stream_url(
-            settings.fallback_url,
-            use_backup=use_backup,
-        )
+        if settings.radio_stream_url:
+            # Checked again on every (re)connect, so a host that later resolves to the LAN is refused
+            await check_public_url(settings.radio_stream_url)
+            stream_url = settings.radio_stream_url
+        else:
+            stream_url = await self._resolve_fallback_stream_url(settings.fallback_url, use_backup)
         logger.info("Starting fallback stream in guild %s: %s", guild.id, stream_url)
 
         async with self._get_lock(guild.id):
@@ -777,7 +770,11 @@ class AudioManager:
     ) -> bool:
         """Play a resolved track; return False if playback was stopped meanwhile."""
         async with self._get_lock(guild.id):
-            if guild.id not in self._wanted:
+            # Radio may have been turned on while this track was resolving
+            if (
+                guild.id not in self._wanted
+                or (await self.db.get_guild_settings(guild.id)).radio_stream_url
+            ):
                 return False
             if index is not None:
                 await self.db.set_current_index(guild.id, index)
@@ -819,6 +816,7 @@ class AudioManager:
                     guild_id not in self._wanted
                     or not settings.on_fallback
                     or not settings.fallback_reason.startswith(AUTO_RADIO_PREFIX)
+                    or settings.radio_stream_url
                 ):
                     return
                 playlist = await self.db.get_playlist(guild_id)

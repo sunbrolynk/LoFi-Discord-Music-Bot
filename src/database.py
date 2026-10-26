@@ -57,6 +57,9 @@ class GuildSettings:
     on_fallback: bool
     fallback_reason: str
     autoplay: bool = False
+    radio_stream_url: str = ""
+    radio_channel_id: int | None = None
+    radio_nowplaying_url: str = ""
 
 
 class DatabaseManager:
@@ -128,10 +131,14 @@ class DatabaseManager:
             )
             cursor = await db.execute("PRAGMA table_info(guild_settings)")
             columns = {row[1] for row in await cursor.fetchall()}
-            if "autoplay" not in columns:
-                await db.execute(
-                    "ALTER TABLE guild_settings ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
-                )
+            for name, definition in (
+                ("autoplay", "INTEGER NOT NULL DEFAULT 0"),
+                ("radio_stream_url", "TEXT NOT NULL DEFAULT ''"),
+                ("radio_channel_id", "INTEGER"),
+                ("radio_nowplaying_url", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    await db.execute(f"ALTER TABLE guild_settings ADD COLUMN {name} {definition}")
             await db.commit()
 
     async def get_guild_settings(self, guild_id: int) -> GuildSettings:
@@ -178,7 +185,33 @@ class DatabaseManager:
                 on_fallback=bool(row["on_fallback"]),
                 fallback_reason=str(row["fallback_reason"]),
                 autoplay=bool(row["autoplay"]),
+                radio_stream_url=str(row["radio_stream_url"]),
+                radio_channel_id=(
+                    int(row["radio_channel_id"]) if row["radio_channel_id"] is not None else None
+                ),
+                radio_nowplaying_url=str(row["radio_nowplaying_url"]),
             )
+
+    async def set_radio(
+        self,
+        guild_id: int,
+        stream_url: str = "",
+        channel_id: int | None = None,
+        nowplaying_url: str = "",
+    ) -> GuildSettings:
+        """Turn a guild's radio on with its stream and channel, or off with no stream."""
+        await self.get_guild_settings(guild_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE guild_settings
+                SET radio_stream_url = ?, radio_channel_id = ?, radio_nowplaying_url = ?
+                WHERE guild_id = ?
+                """,
+                (stream_url, channel_id, nowplaying_url, guild_id),
+            )
+            await db.commit()
+        return await self.get_guild_settings(guild_id)
 
     async def set_channels(
         self,

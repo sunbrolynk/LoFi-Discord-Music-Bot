@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 DEFAULT_RADIO_URL = "https://lofi.radio"
 DEFAULT_DATABASE_PATH = "data/lofi_bot.db"
 DEFAULT_BACKUP_STREAM_URLS = ("https://stream.laut.fm/lofi",)
+HOSTNAME_RE = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))*")
 
 
 @dataclass(frozen=True)
@@ -25,14 +27,7 @@ class BotConfig:
     database_path: Path
     log_level: str
     backup_fallback_stream_urls: tuple[str, ...] = DEFAULT_BACKUP_STREAM_URLS
-    radio_stream_url: str = ""
-    radio_channel_id: int | None = None
-    radio_nowplaying_url: str = ""
-
-    @property
-    def radio_mode(self) -> bool:
-        """True when the bot only plays RADIO_STREAM_URL in RADIO_CHANNEL_ID."""
-        return bool(self.radio_stream_url)
+    radio_trusted_hosts: frozenset[str] = frozenset()
 
     @property
     def log_dir(self) -> Path:
@@ -73,14 +68,7 @@ def load_config() -> BotConfig:
     if not client_secret:
         missing.append("SPOTIFY_CLIENT_SECRET")
 
-    radio_url = os.getenv("RADIO_STREAM_URL", "").strip()
-    radio_channel = os.getenv("RADIO_CHANNEL_ID", "").strip()
-    nowplaying_url = os.getenv("RADIO_NOWPLAYING_URL", "").strip()
-    if radio_url and not radio_channel.isdigit():
-        raise ValueError("RADIO_CHANNEL_ID must be the voice channel's numeric ID in radio mode.")
-    for name, url in (("RADIO_STREAM_URL", radio_url), ("RADIO_NOWPLAYING_URL", nowplaying_url)):
-        if url and not url.startswith(("http://", "https://")):
-            raise ValueError(f"{name} must be an http(s) URL.")
+    trusted_hosts = parse_trusted_hosts(os.getenv("RADIO_TRUSTED_HOSTS", ""))
 
     if missing:
         joined = ", ".join(missing)
@@ -95,12 +83,32 @@ def load_config() -> BotConfig:
         log_level=log_level,
         backup_fallback_stream_urls=parse_url_list(os.getenv("BACKUP_FALLBACK_STREAM_URLS", ""))
         or DEFAULT_BACKUP_STREAM_URLS,
-        radio_stream_url=radio_url,
-        radio_channel_id=int(radio_channel) if radio_url else None,
-        radio_nowplaying_url=nowplaying_url if radio_url else "",
+        radio_trusted_hosts=trusted_hosts,
     )
 
 
 def parse_url_list(raw: str) -> tuple[str, ...]:
     """Split a comma- or whitespace-separated list of http(s) URLs, dropping anything else."""
     return tuple(url for url in re.split(r"[\s,]+", raw) if url.startswith(("http://", "https://")))
+
+
+def parse_trusted_hosts(raw: str) -> frozenset[str]:
+    """Parse RADIO_TRUSTED_HOSTS: comma-separated exact hostnames, nothing else."""
+    hosts: set[str] = set()
+    for entry in raw.split(","):
+        host = entry.strip().lower().rstrip(".")
+        if not entry.strip():
+            continue
+        try:
+            ipaddress.ip_address(host)
+            is_ip = True
+        except ValueError:
+            # A numeric last label is read as an IP address by the system resolver
+            is_ip = host.rsplit(".", 1)[-1].isdigit()
+        if is_ip or not HOSTNAME_RE.fullmatch(host):
+            raise ValueError(
+                f"RADIO_TRUSTED_HOSTS entry {entry.strip()!r} must be an exact hostname such as "
+                "radio.example.com, with no wildcard, IP address, port or scheme."
+            )
+        hosts.add(host)
+    return frozenset(hosts)
