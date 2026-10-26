@@ -22,7 +22,7 @@
 * **Smart Matching and a Resolve Cache**: Searches SoundCloud and YouTube by artist and title. Each result is scored on how close its length is to the Spotify track and how well its title matches. Results that are over 20% off in length, or are a live, reaction, slowed, sped-up, remix or cover version the original isn't, get rejected. The source that worked is saved in the database, so a track resolves once and is never searched again. A source that fails is kept out for 24 hours.
 * **Self-Healing 24/7 Playback**: If the voice connection drops, a stream dies, or a track can't be found, the bot reconnects and retries with backoff (5s up to 5 minutes) instead of going quiet. A watchdog restarts any server that should be playing but has been silent for 90 seconds, and after a container restart the bot rejoins and resumes every server that was playing. `/stop` is the only thing that keeps it off.
 * **Logs and Healthcheck**: Logs go to stdout (Portainer's log view) and to rotating files in `/app/data/logs/bot.log` (5 MB x 6 files) on the data volume, so they survive restarts. The container reports `unhealthy` when the bot loses Discord or a server has been silent for 10 minutes.
-* **Radio-Only Mode**: Set `RADIO_STREAM_URL` and `RADIO_CHANNEL_ID` and the bot plays nothing but that stream in that voice channel, joining it on startup and reconnecting with backoff when the stream or voice connection drops. With `RADIO_NOWPLAYING_URL` set to an AzuraCast now-playing URL, its status shows "Listening to *title – artist*". See [Radio-only mode](#radio-only-mode).
+* **Radio-Only Mode, Per Server**: `/radio on` makes the bot play nothing but one stream in one voice channel on that server, rejoining it on startup and reconnecting with backoff when the stream or voice connection drops. With an AzuraCast now-playing URL, the song shows as that voice channel's status. See [Radio-only mode](#radio-only-mode).
 * **Defense-in-Depth Security & Push Gates**: Every dependency in `requirements.txt` and `requirements-dev.txt` is locked with SHA-256 hashes (`--require-hashes`), and local Git hooks (`pre-commit` and `pre-push`) block leaked secrets with a pinned gitleaks scan and the bot's own token scanner, refuse a push with uncommitted changes, audit both locks with pip-audit, enforce Ruff linting/formatting and Mypy type checks, and run the Pytest unit test suite before any code leaves your machine.
 
 ## Slash Command Reference
@@ -32,6 +32,8 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 | Command | Parameters | Description |
 | :--- | :--- | :--- |
 | `/setup` | `voice_channel`, `control_channel` | Binds the LoFi voice output channel and mod control text channel for the current server (requires **Manage Server** permission). |
+| `/radio on` | `stream_url`, `channel`, `nowplaying_url` *(optional)* | Turns on [radio-only mode](#radio-only-mode) for this server: plays only that stream in that voice channel (requires **Manage Server** permission; works outside the mod channel). |
+| `/radio off` | None | Stops the radio, clears the channel status and turns the playlist commands back on (requires **Manage Server** permission). |
 | `/playlist add` | `spotify_url` | Resolves a Spotify track, album, or playlist URL/URI and appends the tracks to this server's persistent playlist. |
 | `/playlist list` | `page` *(optional)* | Displays the tracks saved in this server's playlist and highlights the active track cursor (`▶️`). |
 | `/playlist remove` | `position` | Removes the track at the given 1-based position and re-sequences the remaining tracks. |
@@ -39,14 +41,14 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 | `/playlist resume` | `start_from` (`saved_position` or `beginning`) | Immediately exits the 24/7 fallback radio stream and restarts this server's custom playlist. |
 | `/fallback config` | `triggers`, `stream_url` *(optional)* | Configures when fallback activates (`on_empty_and_error`, `on_error_only`, `on_empty_only`, `manual_only`) and optionally sets a custom 24/7 Icecast/MP3 stream URL for this server. |
 | `/fallback start` | None | Manually switches this server to the 24/7 fallback LoFi stream immediately. |
-| `/play` | None | Starts or unpauses playback in this server's configured voice channel. |
+| `/play` | None | Starts or unpauses playback in this server's configured voice channel, or restarts its radio when radio is on. |
 | `/pause` | None | Pauses active audio playback. |
 | `/search` | `query` | Searches Spotify for a song and queues it to play next, ahead of the playlist. Plays it right away if nothing from the playlist is playing. The queue isn't saved across restarts. |
 | `/skip` | None | Skips to the next queued song, or the next track in this server's playlist. |
 | `/stop` | None | Stops playback and disconnects the bot from this server's voice channel. |
 | `/mode` | `loop` (`playlist`, `track`, `off`), `shuffle` (`true`/`false`) | Updates loop and shuffle behavior for this server's playlist. |
 | `/volume` | `level` (`1`–`100`) | Sets and saves the playback volume percentage for this server. |
-| `/status` | None | Posts a diagnostic embed: active mode (playlist or fallback radio, with the reason), the current track, the next track up, unplayable tracks skipped in the last hour, bound channels, and saved track count. |
+| `/status` | None | Posts a diagnostic embed: active mode (playlist, fallback radio with the reason, or radio-only), the current track or radio song, the next track up, unplayable tracks skipped in the last hour, bound channels, and saved track count. |
 
 ## First-Time Server Onboarding
 
@@ -71,15 +73,17 @@ All commands (except `/setup` when initializing or rebinding channels) must be r
 
 ## Radio-Only Mode
 
-For a bot that only relays one 24/7 station, set these in its environment:
+For a server that only relays one 24/7 station, someone with **Manage Server** runs:
 
-| Variable | Example | Meaning |
-| :--- | :--- | :--- |
-| `RADIO_STREAM_URL` | `https://stream.audiobookmanager.com/listen/lofi/radio.mp3` | The stream to play. Setting it turns radio mode on. |
-| `RADIO_CHANNEL_ID` | `123456789012345678` | The voice channel's ID (Developer Mode on, right-click the channel, **Copy Channel ID**). Required with `RADIO_STREAM_URL`. |
-| `RADIO_NOWPLAYING_URL` | `https://stream.audiobookmanager.com/api/nowplaying/lofi` | Optional. AzuraCast now-playing JSON, polled every 30 seconds for the bot's "Listening to" status. |
+        /radio on stream_url:https://radio.example.com/listen/lofi/radio.mp3 channel:#lofi-radio nowplaying_url:https://radio.example.com/api/nowplaying/lofi
 
-On startup the bot binds that channel, joins it and plays the stream. If the stream ends or fails it tries the same stream again with backoff (it never switches to the backup stations), and the usual voice reconnect and watchdog apply. `/playlist`, `/fallback`, `/search`, `/skip` and `/mode` reply that they're off; `/play` restarts the stream after a `/stop`, and `/pause`, `/volume` and `/status` work as usual. Run `/setup` once if you want a mod control channel for those. With `RADIO_STREAM_URL` unset nothing changes.
+The setting is saved for that server only. The bot joins the channel and plays the stream, and rejoins it after a restart unless it was stopped with `/stop`. If the stream ends or fails it tries the same stream again with backoff (it never switches to the backup stations), and the usual voice reconnect and watchdog apply. In that server `/playlist`, `/fallback`, `/search`, `/skip` and `/mode` reply that they're off; `/play` restarts the stream after a `/stop`, and `/pause`, `/volume` and `/status` work as usual. Run `/setup` once if you want a mod control channel for those. Other servers are unaffected. `/radio off` stops the radio and turns everything back on.
+
+`nowplaying_url` is optional: an AzuraCast now-playing JSON URL, read every 30 seconds. The song shows as the voice channel's status, which needs the bot to have **Set Voice Channel Status** in that channel. Without it the bot logs one line and keeps playing; `/status` shows the song either way.
+
+Both URLs must be public `http://` or `https://` addresses. The bot looks the host up when `/radio on` runs and again on every reconnect and every now-playing read, and refuses any host that resolves to a loopback, private, link-local, CGNAT, multicast or reserved address. The now-playing read doesn't follow redirects and stops at 64 KB. That check covers the address the bot itself connects to, but the stream player (FFmpeg) can still follow redirects and playlist links to other addresses after it, so on a home network the real block is a firewall rule on the container's outgoing traffic that refuses your private ranges.
+
+One security setting belongs to whoever runs the bot, not to the servers: `RADIO_TRUSTED_HOSTS`, a comma-separated list of exact hostnames (for example `RADIO_TRUSTED_HOSTS=radio.example.com`). A radio URL whose host is exactly one of them may resolve to a private address, for a stream host that split DNS points at your own network. Loopback, link-local, multicast and unspecified addresses stay refused even then, and a subdomain or longer name (`evil.radio.example.com`) isn't trusted. Entries are matched case-insensitively with a trailing dot ignored; a wildcard, IP address, port or scheme stops the bot at startup with a message naming the entry. It's empty by default, and radio itself is still turned on and off from Discord. Anyone with **Manage Server** in any server the bot is in can point their radio at a trusted host, so list only hosts you'd let every such server reach.
 
 ### Running several copies
 
@@ -104,9 +108,7 @@ Each copy needs its own `DISCORD_BOT_TOKEN` and its own `DATABASE_PATH` folder: 
               - BACKUP_FALLBACK_STREAM_URLS=${BACKUP_FALLBACK_STREAM_URLS:-https://stream.laut.fm/lofi}
               - DATABASE_PATH=/app/data/lofi_bot.db
               - LOG_LEVEL=${LOG_LEVEL:-INFO}
-              - RADIO_STREAM_URL=${RADIO_STREAM_URL:-}
-              - RADIO_CHANNEL_ID=${RADIO_CHANNEL_ID:-}
-              - RADIO_NOWPLAYING_URL=${RADIO_NOWPLAYING_URL:-}
+              - RADIO_TRUSTED_HOSTS=${RADIO_TRUSTED_HOSTS:-}
             volumes:
               - lofi_bot_data:/app/data
 
@@ -119,7 +121,7 @@ Each copy needs its own `DISCORD_BOT_TOKEN` and its own `DATABASE_PATH` folder: 
    * `SPOTIFY_CLIENT_SECRET` = your Spotify Client Secret
    * `DEFAULT_FALLBACK_STREAM_URL` = `https://lofi.radio` *(optional override; new servers start with it, `/fallback config` changes one server)*
    * `BACKUP_FALLBACK_STREAM_URLS` = `https://stream.laut.fm/lofi` *(optional; comma-separated stations tried in order when a server's own fallback is down)*
-   * `RADIO_STREAM_URL`, `RADIO_CHANNEL_ID`, `RADIO_NOWPLAYING_URL` *(optional; see [Radio-only mode](#radio-only-mode))*
+   * `RADIO_TRUSTED_HOSTS` *(optional; exact hostnames a radio URL may use on your own network, see [Radio-only mode](#radio-only-mode))*
 
    Before playing a fallback station the bot checks it. A station that answers 404 or doesn't answer is skipped for 30 minutes and logged once. If every backup is down, they all get checked again rather than going silent.
 4. Click **Deploy the stack**.
