@@ -9,13 +9,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- Radio-only mode: with `RADIO_STREAM_URL` and `RADIO_CHANNEL_ID` set, the bot joins that voice
-  channel on startup and plays only that stream, retrying it with backoff when it or the voice
-  connection drops. Playlist, fallback, search, skip and mode commands reply that they're off.
-- In radio mode `/setup` is off, and `/play` only restarts the configured stream in the configured
-  channel, so no other server can point the bot at its own stream or channel.
-- `RADIO_NOWPLAYING_URL`: polls an AzuraCast now-playing URL every 30 seconds and shows the song
-  as the bot's "Listening to" status.
+- Radio-only mode, per server: `/radio on` (Manage Server) saves a stream and a voice channel for
+  that server, joins it and plays only that stream, retrying it with backoff when it or the voice
+  connection drops, and rejoins it after a restart unless it was stopped with `/stop`. Playlist,
+  fallback, search, skip and mode commands reply that they're off in that server only; `/play`
+  restarts its stream and `/radio off` turns everything back on.
+- An optional AzuraCast now-playing URL on `/radio on`, read every 30 seconds, shows the song as
+  that voice channel's status and in `/status`. Without the Set Voice Channel Status permission
+  the bot logs it once and keeps playing.
+- Radio URLs must be public http(s) addresses: hosts that resolve to loopback, private,
+  link-local, CGNAT, multicast or reserved addresses are refused at `/radio on` and on every
+  reconnect and read, and the now-playing read follows no redirects and stops at 64 KB. The
+  stream player can still follow redirects and playlist links past that check, so a firewall rule
+  on the container's outgoing traffic is the real block on a home network.
+- `RADIO_TRUSTED_HOSTS`: exact hostnames a radio URL may use even when they resolve to a private
+  address, for a stream host behind split DNS. Loopback, link-local, multicast and unspecified
+  addresses stay refused, and a bad entry stops the bot at startup.
+
+### Removed
+
+- The `RADIO_STREAM_URL`, `RADIO_CHANNEL_ID` and `RADIO_NOWPLAYING_URL` settings. A server that used
+  them keeps that stream as its fallback with the playlist commands back on; run `/radio on` there
+  to make it radio-only again.
 
 ## [1.0.0]
 

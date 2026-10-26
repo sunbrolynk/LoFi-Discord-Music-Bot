@@ -9,13 +9,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from src.audio_manager import AudioManager
-from src.database import DatabaseManager, PlaylistTrack
+from src.audio_manager import RADIO_MODE_REASON, AudioManager
+from src.database import DatabaseManager, GuildSettings, PlaylistTrack
+from src.radio import RadioStatus, RadioURLError, check_public_url
 from src.spotify_client import SpotifyResolver
 
 TRACKS_PER_PAGE = 10
-# Commands that pick what plays or where; radio mode only ever plays its one stream in its one channel
-RADIO_BLOCKED_COMMANDS = frozenset({"playlist", "fallback", "search", "skip", "mode", "setup"})
+# Commands that pick what plays; a server's radio only ever plays its one stream in its one channel
+RADIO_BLOCKED_COMMANDS = frozenset({"playlist", "fallback", "search", "skip", "mode"})
 
 
 def blocked_in_radio_mode(command_name: str) -> bool:
@@ -44,6 +45,11 @@ class MusicCommandsCog(commands.Cog):
         name="fallback",
         description="Configure and control this server's 24/7 fallback LoFi radio stream.",
     )
+    radio_group = app_commands.Group(
+        name="radio",
+        description="Play only one stream in one voice channel on this server.",
+        default_permissions=discord.Permissions(manage_guild=True),
+    )
 
     def __init__(
         self,
@@ -51,25 +57,13 @@ class MusicCommandsCog(commands.Cog):
         db: DatabaseManager,
         spotify: SpotifyResolver,
         audio: AudioManager,
-        radio_mode: bool = False,
-        radio_channel_id: int | None = None,
-        radio_stream_url: str = "",
+        radio_status: RadioStatus,
     ) -> None:
         self.bot = bot
         self.db = db
         self.spotify = spotify
         self.audio = audio
-        self.radio_mode = radio_mode
-        self.radio_channel_id = radio_channel_id
-        self.radio_stream_url = radio_stream_url
-
-    async def _play_radio(self, guild: discord.Guild) -> str:
-        """Restart radio mode's configured stream in its configured channel, never a server's own settings."""
-        channel = self.bot.get_channel(self.radio_channel_id or 0)
-        if not isinstance(channel, discord.VoiceChannel) or channel.guild.id != guild.id:
-            return "📻 This bot's radio only plays in its own channel."
-        await self.audio.start_radio(channel, self.radio_stream_url)
-        return "📻 Playing the radio stream."
+        self.radio_status = radio_status
 
     async def _require_mod_channel(self, interaction: discord.Interaction) -> bool:
         """Verify the interaction occurred inside the guild's configured mod control channel."""
@@ -80,19 +74,20 @@ class MusicCommandsCog(commands.Cog):
             )
             return False
 
+        settings = await self.db.get_guild_settings(interaction.guild.id)
         command = interaction.command
         if (
-            self.radio_mode
+            settings.radio_stream_url
             and command is not None
             and blocked_in_radio_mode(command.qualified_name)
         ):
             await interaction.response.send_message(
-                "📻 This bot only plays its radio stream, so playlist commands are off.",
+                "📻 This server's radio is on, so playlist commands are off. "
+                "An admin can run `/radio off` to turn them back on.",
                 ephemeral=True,
             )
             return False
 
-        settings = await self.db.get_guild_settings(interaction.guild.id)
         if settings.control_channel_id is None:
             await interaction.response.send_message(
                 "This server has not configured its channels yet. "
@@ -145,6 +140,81 @@ class MusicCommandsCog(commands.Cog):
             color=discord.Color.purple(),
         )
         await interaction.response.send_message(embed=embed)
+
+    async def _start_radio(self, guild: discord.Guild) -> None:
+        """Play the server's radio stream; if it's down, keep retrying it with backoff."""
+        try:
+            await self.audio.start_fallback(guild, reason=RADIO_MODE_REASON, announce=False)
+        except Exception as exc:
+            self.audio.schedule_recovery(guild, f"radio stream didn't start: {exc}")
+
+    async def _clear_radio_status(self, guild: discord.Guild, settings: GuildSettings) -> None:
+        """Clear the song from the radio channel's status, while the bot is still in it."""
+        channel = guild.get_channel(settings.radio_channel_id or 0)
+        if isinstance(channel, discord.VoiceChannel) and settings.radio_nowplaying_url:
+            await self.radio_status.set_status(channel, None)
+
+    @radio_group.command(
+        name="on",
+        description="Play only this stream in this voice channel, until /radio off.",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def radio_on(
+        self,
+        interaction: discord.Interaction,
+        stream_url: str,
+        channel: discord.VoiceChannel,
+        nowplaying_url: str | None = None,
+    ) -> None:
+        """Save this server's radio stream and channel, then start playing it."""
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command must be run inside a server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        stream_url, nowplaying_url = stream_url.strip(), (nowplaying_url or "").strip()
+        try:
+            await check_public_url(stream_url)
+            if nowplaying_url:
+                await check_public_url(nowplaying_url)
+        except RadioURLError as exc:
+            await interaction.followup.send(f"⚠️ Radio not started: {exc}")
+            return
+
+        previous = await self.db.get_guild_settings(interaction.guild.id)
+        self.radio_status.stop(interaction.guild.id)
+        await self._clear_radio_status(interaction.guild, previous)
+        await self.db.set_radio(interaction.guild.id, stream_url, channel.id, nowplaying_url)
+        await self._start_radio(interaction.guild)
+        if nowplaying_url:
+            self.radio_status.start(interaction.guild)
+        await interaction.followup.send(
+            f"📻 Radio is on in {channel.mention}. Playlist, fallback, search, skip and mode "
+            "commands are off here until `/radio off`."
+        )
+
+    @radio_group.command(name="off", description="Stop the radio and go back to the playlist bot.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def radio_off(self, interaction: discord.Interaction) -> None:
+        """Stop this server's radio, clear its channel status and forget its settings."""
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command must be run inside a server.", ephemeral=True
+            )
+            return
+        settings = await self.db.get_guild_settings(interaction.guild.id)
+        if not settings.radio_stream_url:
+            await interaction.response.send_message("📻 Radio is already off.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.radio_status.stop(interaction.guild.id)
+        await self._clear_radio_status(interaction.guild, settings)
+        await self.audio.stop_and_disconnect(interaction.guild)
+        await self.db.set_radio(interaction.guild.id)
+        await interaction.followup.send(
+            "📻 Radio is off. Run `/play` to start this server's playlist."
+        )
 
     @playlist_group.command(
         name="add",
@@ -358,11 +428,15 @@ class MusicCommandsCog(commands.Cog):
             return
 
         await interaction.response.defer()
-        if self.radio_mode:
+        settings = await self.db.get_guild_settings(interaction.guild.id)
+        if settings.radio_stream_url:
             try:
-                await interaction.followup.send(await self._play_radio(interaction.guild))
-            except Exception as exc:
-                await interaction.followup.send(f"⚠️ Playback failed: {exc}")
+                await check_public_url(settings.radio_stream_url)
+            except RadioURLError as exc:
+                await interaction.followup.send(f"⚠️ Radio not started: {exc}")
+                return
+            await self._start_radio(interaction.guild)
+            await interaction.followup.send("📻 Playing the radio stream.")
             return
         self.audio.forget_failures(interaction.guild.id)
         try:
@@ -423,6 +497,9 @@ class MusicCommandsCog(commands.Cog):
         assert interaction.guild is not None
 
         await interaction.response.defer()
+        settings = await self.db.get_guild_settings(interaction.guild.id)
+        if settings.radio_stream_url:
+            await self._clear_radio_status(interaction.guild, settings)
         await self.audio.stop_and_disconnect(interaction.guild)
         await interaction.followup.send("⏹️ Stopped playback and disconnected.")
 
@@ -524,7 +601,11 @@ class MusicCommandsCog(commands.Cog):
             if settings.on_fallback
             else "🎶 Custom Server Playlist"
         )
-        if settings.on_fallback:
+        song = self.radio_status.current(interaction.guild.id)
+        if settings.radio_stream_url:
+            mode_label = f"📻 Radio in <#{settings.radio_channel_id}>"
+            now_playing = discord.utils.escape_markdown(song) if song else "The radio stream"
+        elif settings.on_fallback:
             now_playing = f"`{settings.fallback_url}`"
         elif isinstance(active, PlaylistTrack):
             now_playing = (
@@ -535,7 +616,11 @@ class MusicCommandsCog(commands.Cog):
         else:
             now_playing = "Stopped / Idle"
         queued = self.audio.queue_length(interaction.guild.id)
-        upcoming = self.audio.next_up(interaction.guild.id, playlist)
+        upcoming = (
+            None
+            if settings.radio_stream_url
+            else self.audio.next_up(interaction.guild.id, playlist)
+        )
         up_next = f"**{upcoming.title}** — {upcoming.artist}" if upcoming else "Nothing planned"
         skips = self.audio.skips_last_hour(interaction.guild.id)
         voice_mention = (

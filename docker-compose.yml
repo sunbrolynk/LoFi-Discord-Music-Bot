@@ -12,9 +12,7 @@ services:
       - BACKUP_FALLBACK_STREAM_URLS=${BACKUP_FALLBACK_STREAM_URLS:-https://stream.laut.fm/lofi}
       - DATABASE_PATH=/app/data/lofi_bot.db
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - RADIO_STREAM_URL=${RADIO_STREAM_URL:-}
-      - RADIO_CHANNEL_ID=${RADIO_CHANNEL_ID:-}
-      - RADIO_NOWPLAYING_URL=${RADIO_NOWPLAYING_URL:-}
+      - RADIO_TRUSTED_HOSTS=${RADIO_TRUSTED_HOSTS:-}
     volumes:
       - lofi_bot_data:/app/data
 
