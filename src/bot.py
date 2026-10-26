@@ -123,6 +123,8 @@ class LoFiBot(commands.Bot):
                 spotify=self.spotify,
                 audio=self.audio,
                 radio_mode=self.config.radio_mode,
+                radio_channel_id=self.config.radio_channel_id,
+                radio_stream_url=self.config.radio_stream_url,
             )
         )
         synced = await self.tree.sync()

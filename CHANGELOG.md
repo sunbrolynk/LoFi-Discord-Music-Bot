@@ -12,6 +12,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Radio-only mode: with `RADIO_STREAM_URL` and `RADIO_CHANNEL_ID` set, the bot joins that voice
   channel on startup and plays only that stream, retrying it with backoff when it or the voice
   connection drops. Playlist, fallback, search, skip and mode commands reply that they're off.
+- In radio mode `/setup` is off, and `/play` only restarts the configured stream in the configured
+  channel, so no other server can point the bot at its own stream or channel.
 - `RADIO_NOWPLAYING_URL`: polls an AzuraCast now-playing URL every 30 seconds and shows the song
   as the bot's "Listening to" status.
 

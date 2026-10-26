@@ -9,13 +9,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from src.audio_manager import RADIO_MODE_REASON, AudioManager
+from src.audio_manager import AudioManager
 from src.database import DatabaseManager, PlaylistTrack
 from src.spotify_client import SpotifyResolver
 
 TRACKS_PER_PAGE = 10
-# Commands that pick what plays; radio mode only ever plays its stream
-RADIO_BLOCKED_COMMANDS = frozenset({"playlist", "fallback", "search", "skip", "mode"})
+# Commands that pick what plays or where; radio mode only ever plays its one stream in its one channel
+RADIO_BLOCKED_COMMANDS = frozenset({"playlist", "fallback", "search", "skip", "mode", "setup"})
 
 
 def blocked_in_radio_mode(command_name: str) -> bool:
@@ -52,12 +52,24 @@ class MusicCommandsCog(commands.Cog):
         spotify: SpotifyResolver,
         audio: AudioManager,
         radio_mode: bool = False,
+        radio_channel_id: int | None = None,
+        radio_stream_url: str = "",
     ) -> None:
         self.bot = bot
         self.db = db
         self.spotify = spotify
         self.audio = audio
         self.radio_mode = radio_mode
+        self.radio_channel_id = radio_channel_id
+        self.radio_stream_url = radio_stream_url
+
+    async def _play_radio(self, guild: discord.Guild) -> str:
+        """Restart radio mode's configured stream in its configured channel, never a server's own settings."""
+        channel = self.bot.get_channel(self.radio_channel_id or 0)
+        if not isinstance(channel, discord.VoiceChannel) or channel.guild.id != guild.id:
+            return "📻 This bot's radio only plays in its own channel."
+        await self.audio.start_radio(channel, self.radio_stream_url)
+        return "📻 Playing the radio stream."
 
     async def _require_mod_channel(self, interaction: discord.Interaction) -> bool:
         """Verify the interaction occurred inside the guild's configured mod control channel."""
@@ -348,10 +360,7 @@ class MusicCommandsCog(commands.Cog):
         await interaction.response.defer()
         if self.radio_mode:
             try:
-                await self.audio.start_fallback(
-                    interaction.guild, reason=RADIO_MODE_REASON, announce=False
-                )
-                await interaction.followup.send("📻 Playing the radio stream.")
+                await interaction.followup.send(await self._play_radio(interaction.guild))
             except Exception as exc:
                 await interaction.followup.send(f"⚠️ Playback failed: {exc}")
             return

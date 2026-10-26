@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from src import bot
 from src.audio_manager import RADIO_MODE_REASON, AudioManager
@@ -135,9 +136,17 @@ async def test_fetch_now_playing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_blocked_in_radio_mode_covers_playlist_commands_only() -> None:
-    for name in ("playlist add", "playlist resume", "fallback start", "search", "skip", "mode"):
+    for name in (
+        "playlist add",
+        "playlist resume",
+        "fallback start",
+        "search",
+        "skip",
+        "mode",
+        "setup",
+    ):
         assert blocked_in_radio_mode(name) is True
-    for name in ("play", "pause", "stop", "volume", "status", "setup"):
+    for name in ("play", "pause", "stop", "volume", "status"):
         assert blocked_in_radio_mode(name) is False
 
 
@@ -206,3 +215,22 @@ async def test_radio_retries_its_own_stream_after_it_died(tmp_path: Path) -> Non
     manager.mark_stream_dead(STREAM, "stream ended")
     manager._stream_reachable = AsyncMock(return_value=True)  # type: ignore[method-assign]
     assert await manager._resolve_fallback_stream_url(STREAM, use_backup=True) == STREAM
+
+
+async def test_play_in_radio_mode_uses_only_the_configured_channel_and_stream(
+    tmp_path: Path,
+) -> None:
+    cog = await make_cog(tmp_path, radio_mode=True)
+    cog.radio_channel_id, cog.radio_stream_url = 7, STREAM
+    channel = MagicMock(spec=discord.VoiceChannel)
+    channel.guild.id = 1
+    cog.bot.get_channel = MagicMock(return_value=channel)  # type: ignore[method-assign]
+    cog.audio.start_radio = AsyncMock()  # type: ignore[method-assign]
+    own, other = MagicMock(), MagicMock()
+    own.id, other.id = 1, 2
+
+    assert "only plays in its own channel" in await cog._play_radio(other)
+    cog.audio.start_radio.assert_not_awaited()
+
+    assert await cog._play_radio(own) == "📻 Playing the radio stream."
+    cog.audio.start_radio.assert_awaited_once_with(channel, STREAM)
